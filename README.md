@@ -68,18 +68,14 @@ tests/wire.rs    三接口 mock 集成测试(不碰真实网络)
 并记录其 workspace；在同一路径启动 Zerone 后用 `/session` 查找，再用
 `/session ID` 恢复。可设置 `ZERONE_HOME` 覆盖数据目录，便于测试或便携安装。
 
-## 打包 npm
+## 打包与发布 npm
 
-本机构建当前平台并生成测试 tarball：
+本机构建即可，当前zerone只支持windows。
 
 ```powershell
 .\scripts\package-npm.ps1 -Pack
 node .\dist\npm\package\bin\zerone.js --help
 ```
-
-本地 tarball 只包含当前平台，不应作为跨平台正式版本发布。正式包通过 GitHub
-Actions 的 `Package npm release` workflow 构建 Windows x64、Linux x64(musl)、macOS
-x64/arm64；下载它生成的 `npm-package-*` artifact 后手动发布：
 
 ```bash
 npm publish zerone-agent-0.1.0.tgz --access public
@@ -87,3 +83,4 @@ npm publish zerone-agent-0.1.0.tgz --access public
 
 版本默认读取 `Cargo.toml`，也可以在手动运行 workflow 时覆盖包名和版本。npm
 包只包含 Node 启动器与预编译二进制，运行时仍是同一个 Rust `zerone` 进程。
+所以发布后续版本只需更新 Cargo.toml 版本
