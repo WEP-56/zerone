@@ -124,7 +124,7 @@ mod tests {
     }
 
     fn tmpdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("harness-test-{}", name));
+        let d = std::env::temp_dir().join(format!("zerone-test-{}", name));
         std::fs::create_dir_all(&d).unwrap();
         d
     }

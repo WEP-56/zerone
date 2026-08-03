@@ -14,10 +14,10 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use harness::config::Config;
-use harness::event::{AgentCommand, AgentEvent};
-use harness::runtime::Agent;
-use harness::workspace::Workspace;
+use zerone::config::Config;
+use zerone::event::{AgentCommand, AgentEvent};
+use zerone::runtime::Agent;
+use zerone::workspace::Workspace;
 
 // ---------------------------------------------------------------------------
 // mock SSE 服务器
@@ -133,9 +133,9 @@ fn run_agent_against(api: &str, port: u16) -> Vec<AgentEvent> {
         std::env::remove_var(k);
     }
 
-    let dir = std::env::temp_dir().join(format!("harness-wire-{}-{}", api, port));
+    let dir = std::env::temp_dir().join(format!("zerone-wire-{}-{}", api, port));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("hello.txt"), "hello from harness\n").unwrap();
+    std::fs::write(dir.join("hello.txt"), "hello from zerone\n").unwrap();
 
     let config_path = dir.join("config.toml");
     std::fs::write(
@@ -157,7 +157,12 @@ api_key = "test-key"
     .unwrap();
 
     let cfg = Config::load(&config_path).unwrap();
-    let mut agent = Agent::new(cfg, Workspace::new(PathBuf::from(&dir))).unwrap();
+    let mut agent = Agent::new_with_data_dir(
+        cfg,
+        Workspace::new(PathBuf::from(&dir)),
+        dir.join(".zerone-test"),
+    )
+    .unwrap();
 
     let mut events: Vec<AgentEvent> = Vec::new();
     let cancel = AtomicBool::new(false);
@@ -188,7 +193,7 @@ fn assert_common_events(events: &[AgentEvent]) {
                 assert_eq!(name, "read_file");
                 assert!(!is_error, "read_file 不应报错: {}", output);
                 assert!(
-                    output.contains("hello from harness"),
+                    output.contains("hello from zerone"),
                     "工具输出应包含文件内容: {}",
                     output
                 );
@@ -272,14 +277,14 @@ fn anthropic_full_tool_roundtrip() {
     assert!(msgs[2]["content"][0]["content"]
         .as_str()
         .unwrap()
-        .contains("hello from harness"));
+        .contains("hello from zerone"));
     // 工具声明与系统提示
     assert!(body["tools"]
         .as_array()
         .unwrap()
         .iter()
         .any(|t| t["name"] == "read_file" && t["input_schema"]["type"] == "object"));
-    assert!(body["system"].as_str().unwrap().contains("Harness"));
+    assert!(body["system"].as_str().unwrap().contains("Zerone"));
     server.finish();
 }
 
@@ -327,7 +332,7 @@ fn chat_completions_full_tool_roundtrip() {
     assert!(msgs[3]["content"]
         .as_str()
         .unwrap()
-        .contains("hello from harness"));
+        .contains("hello from zerone"));
     // 工具声明包一层 function;显式请求用量
     assert_eq!(body["tools"][0]["type"], "function");
     assert!(body["tools"][0]["function"]["parameters"]["type"] == "object");
@@ -380,7 +385,7 @@ fn responses_full_tool_roundtrip() {
 
     let body = server.body(1);
     assert_eq!(body["store"], false);
-    assert!(body["instructions"].as_str().unwrap().contains("Harness"));
+    assert!(body["instructions"].as_str().unwrap().contains("Zerone"));
     let input = body["input"].as_array().unwrap();
     // [0] user 消息, [1] reasoning(原样回传), [2] function_call, [3] function_call_output
     assert_eq!(input[0]["type"], "message");
@@ -394,7 +399,7 @@ fn responses_full_tool_roundtrip() {
     assert!(input[3]["output"]
         .as_str()
         .unwrap()
-        .contains("hello from harness"));
+        .contains("hello from zerone"));
     // reasoning 必须排在它的 function_call 之前(API 硬性要求)
     // 工具声明是平铺的
     assert_eq!(body["tools"][0]["type"], "function");

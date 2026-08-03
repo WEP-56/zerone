@@ -1,8 +1,8 @@
 [package]
-name = "harness"
+name = "zerone"
 version = "0.1.0"
 edition = "2021"
-description = "极小但结构正确的 Agent Harness 教学项目"
+description = "Zerone: 极小但结构正确的 Coding Agent 教学项目"
 
 [dependencies]
 # 错误处理:教学项目用 anyhow 保持噪音最低
@@ -11,6 +11,10 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# 每个会话一个 SQLite 数据库；bundled 保证用户无需预装 SQLite。
+rusqlite = { version = "0.32", features = ["bundled"] }
+# 会话文件名使用随机 UUID，既可跨进程生成，也不泄露路径信息。
+uuid = { version = "1", features = ["v4"] }
 # HTTP:选阻塞式 ureq 而非 reqwest/tokio——没有异步运行时,数据流一眼可见
 ureq = "2"
 # TUI:只依赖 ratatui,crossterm 用它的 re-export,避免版本错配

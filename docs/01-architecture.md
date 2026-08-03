@@ -29,18 +29,12 @@
                      ┌────────▼──────────────┴────────┐
                      │  runtime.rs  Agent Loop         │
                      │  组装上下文→调模型→执行工具→回填→循环│
-                     └──┬───────────┬───────────┬─────┘
-              ┌─────────▼──┐  ┌────▼──────┐  ┌─▼──────────────┐
-              │ context/    │  │ tools/    │  │ provider/       │
-              │ 模型看什么   │  │ 模型能做什么│  │ 模型是谁         │
-              │ ·instructions│ │ ·Tool trait│  │ ·Provider trait │
-              │ ·workspace  │  │ ·Registry  │  │ ·sse.rs         │
-              │ ·conversation│ │ ·五个工具   │  │ ·三个适配器      │
-              └─────────────┘  └────┬──────┘  └─────────────────┘
-                                    │ 一切文件访问
-                              ┌─────▼──────┐
-                              │ workspace.rs│
-                              └────────────┘
+                     └────────────────────────────────┘
+                        ├─ context/    模型看什么(instructions / 环境 / 历史)
+                        ├─ tools/      模型能做什么(Tool trait / 五个工具)
+                        │    └─ workspace.rs  一切文件访问
+                        ├─ provider/   模型是谁(Provider trait / 三个适配器)
+                        └─ storage.rs  SQLite 会话历史(~/.zerone/sessions/*.db)
 ```
 
 三个竖井分别回答 agent 的三个基本问题,这也是往后一切扩展的归类依据:
@@ -64,8 +58,9 @@
      └ 经 Workspace 读文件、加行号            workspace.rs
 10 emit ToolCallFinished(截断后的预览)
 11 结果作为 Block::ToolResult 写回历史       runtime.rs
-12 回到第 4 步(历史里多了一轮工具往返)
-13 模型这次直接回答 → 无 ToolUse → emit TurnFinished
+12 ToolUse + ToolResult 在同一事务落库          storage.rs
+13 回到第 4 步(历史里多了一轮工具往返)
+14 模型这次直接回答 → 无 ToolUse → emit TurnFinished
 ```
 
 第 4~12 步就是需求里的 `User → LLM → Tool Call → Execute → Observation → LLM`
@@ -86,6 +81,7 @@
 | `src/provider/{anthropic,openai_chat,openai_responses}.rs` | 三个适配器 | — | 04 |
 | `src/event.rs` | Runtime↔前端契约 | `AgentCommand` `AgentEvent` | 02 |
 | `src/runtime.rs` | Agent Loop、线程装配 | `Agent` `RuntimeHandle` `spawn` | 02 |
+| `src/storage.rs` | `~/.zerone` 路径、SQLite 会话存储 | `AppPaths` `SessionManager` | 02 |
 | `src/tui/` | 交互前端 | `App` `Transcript` `InputBox` | — |
 | `src/config.rs` | config.toml 解析、key 查找 | `Config` `ProviderSettings` | — |
 | `src/util.rs` | 清洗/截断/摘要 | — | 03 |
@@ -116,6 +112,8 @@
 2. **重试幂等**:只有"尚未产生任何流事件"的调用失败才能自动重试。
 3. **一切进模型/进画面的文本都过 `util::sanitize` + 截断**,
    否则子进程的 ANSI 码会画花 TUI,超长输出会撑爆上下文。
+4. **有关联的持久化必须原子提交**:带 `ToolUse` 的 assistant 消息与配对的
+   `ToolResult` 在同一个 SQLite 事务中写入,崩溃后不能恢复出非法历史。
 
 ## 代码量
 

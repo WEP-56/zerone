@@ -36,6 +36,7 @@ use crate::context::{ContextProvider, PromptContext};
 use crate::event::{AgentCommand, AgentEvent};
 use crate::message::{Block, ChatMessage, Role, StopReason, Usage};
 use crate::provider::{build_provider, Provider, ProviderEvent};
+use crate::storage::{AppPaths, SessionManager};
 use crate::tools::{default_registry, detect_shell, ToolRegistry, ToolSpec};
 use crate::util;
 use crate::workspace::Workspace;
@@ -55,10 +56,22 @@ pub struct Agent {
     provider: Box<dyn Provider>,
     config: Config,
     usage_total: Usage,
+    sessions: SessionManager,
 }
 
 impl Agent {
     pub fn new(config: Config, workspace: Workspace) -> anyhow::Result<Agent> {
+        let paths = AppPaths::discover()?;
+        paths.ensure()?;
+        Self::new_with_data_dir(config, workspace, paths.root)
+    }
+
+    /// 显式指定数据目录，供测试与嵌入场景隔离用户的 `~/.zerone`。
+    pub fn new_with_data_dir(
+        config: Config,
+        workspace: Workspace,
+        data_dir: std::path::PathBuf,
+    ) -> anyhow::Result<Agent> {
         let shell = detect_shell(&config.shell);
         let extra_context: Vec<Box<dyn ContextProvider>> = vec![
             Box::new(Instructions::new(config.system_prompt.clone())),
@@ -66,6 +79,9 @@ impl Agent {
             // ← 未来的 PlanningContext / MemoryContext 插在这里
         ];
         let settings = config.resolve_provider(&config.active_provider)?;
+        let paths = AppPaths::from_root(data_dir);
+        paths.ensure()?;
+        let sessions = SessionManager::create(paths.sessions, workspace.root())?;
         Ok(Agent {
             workspace,
             tools: default_registry(shell),
@@ -74,11 +90,16 @@ impl Agent {
             provider: build_provider(settings),
             config,
             usage_total: Usage::default(),
+            sessions,
         })
     }
 
     pub fn provider_label(&self) -> String {
         self.provider.label()
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.sessions.current_id()
     }
 
     /// 处理一条命令;返回 false 表示 Runtime 应当退出。
@@ -94,9 +115,14 @@ impl Agent {
                 true
             }
             AgentCommand::ClearConversation => {
-                self.conversation.clear();
-                self.usage_total = Usage::default();
-                emit(AgentEvent::ConversationCleared);
+                match self.sessions.clear() {
+                    Ok(()) => {
+                        self.conversation.clear();
+                        self.usage_total = Usage::default();
+                        emit(AgentEvent::ConversationCleared);
+                    }
+                    Err(e) => emit(AgentEvent::Error(format!("清空会话数据库失败: {:#}", e))),
+                }
                 true
             }
             AgentCommand::SwitchProvider(name) => {
@@ -126,6 +152,32 @@ impl Agent {
                 )));
                 true
             }
+            AgentCommand::ListSessions => {
+                match self.sessions.list() {
+                    Ok(sessions) => emit(AgentEvent::SessionsListed {
+                        current_id: self.sessions.current_id().to_string(),
+                        sessions,
+                    }),
+                    Err(e) => emit(AgentEvent::Error(format!("读取会话列表失败: {:#}", e))),
+                }
+                true
+            }
+            AgentCommand::LoadSession(id) => {
+                match self.sessions.load(&id) {
+                    Ok((messages, usage)) => {
+                        self.conversation = Conversation::from_messages(messages.clone());
+                        self.usage_total = usage;
+                        emit(AgentEvent::SessionLoaded {
+                            id: self.sessions.current_id().to_string(),
+                            messages,
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                        });
+                    }
+                    Err(e) => emit(AgentEvent::Error(format!("恢复会话失败: {:#}", e))),
+                }
+                true
+            }
             AgentCommand::Shutdown => false,
         }
     }
@@ -143,7 +195,9 @@ impl Agent {
     /// Agent Loop 本体。
     fn run_turn(&mut self, input: String, emit: &mut dyn FnMut(AgentEvent), cancel: &AtomicBool) {
         emit(AgentEvent::UserMessage(input.clone()));
-        self.conversation.push(ChatMessage::user_text(input));
+        let user_message = ChatMessage::user_text(input);
+        self.conversation.push(user_message.clone());
+        self.persist(&[user_message], emit);
         emit(AgentEvent::TurnStarted);
 
         let specs: Vec<ToolSpec> = self.tools.specs();
@@ -186,10 +240,24 @@ impl Agent {
                 .into_iter()
                 .map(|(id, name, args)| (id.to_string(), name.to_string(), args.clone()))
                 .collect();
-            self.conversation.push(output.message);
+            if let Some((id, name, _)) = calls
+                .iter()
+                .find(|(id, name, _)| id.trim().is_empty() || name.trim().is_empty())
+            {
+                emit(AgentEvent::Error(format!(
+                    "模型返回了无效工具调用(id={:?},name={:?});\
+                     本次 assistant 消息未写入历史，会话仍可继续",
+                    id, name
+                )));
+                emit(AgentEvent::TurnFinished { cancelled: false });
+                return;
+            }
+            let assistant_message = output.message;
+            self.conversation.push(assistant_message.clone());
 
             // ---- 3. 没有工具调用 → 本轮结束 ----
             if calls.is_empty() {
+                self.persist(&[assistant_message], emit);
                 if output.stop == StopReason::MaxTokens {
                     emit(AgentEvent::Notice(
                         "输出撞到 max_tokens 上限,可能不完整".into(),
@@ -231,10 +299,13 @@ impl Agent {
                     is_error: outcome.is_error,
                 });
             }
-            self.conversation.push(ChatMessage {
+            let result_message = ChatMessage {
                 role: Role::User,
                 blocks: results,
-            });
+            };
+            self.conversation.push(result_message.clone());
+            // ToolUse 与所有 ToolResult 必须原子落库，否则崩溃恢复后历史会非法。
+            self.persist(&[assistant_message, result_message], emit);
             if was_cancelled {
                 emit(AgentEvent::TurnFinished { cancelled: true });
                 return;
@@ -247,6 +318,12 @@ impl Agent {
             self.config.max_turns
         )));
         emit(AgentEvent::TurnFinished { cancelled: false });
+    }
+
+    fn persist(&mut self, messages: &[ChatMessage], emit: &mut dyn FnMut(AgentEvent)) {
+        if let Err(e) = self.sessions.append_batch(messages, self.usage_total) {
+            emit(AgentEvent::Error(format!("保存会话失败: {:#}", e)));
+        }
     }
 
     /// 单次模型调用 + 重试策略。
@@ -319,6 +396,7 @@ pub struct RuntimeHandle {
     pub cancel: Arc<AtomicBool>,
     pub provider_label: String,
     pub provider_names: Vec<String>,
+    pub session_id: String,
 }
 
 /// 把 Agent 装进工作线程,返回通道句柄。TUI 前端用这个;
@@ -326,6 +404,7 @@ pub struct RuntimeHandle {
 pub fn spawn(agent: Agent) -> RuntimeHandle {
     let provider_label = agent.provider_label();
     let provider_names = agent.config.provider_names();
+    let session_id = agent.session_id().to_string();
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<AgentCommand>();
     let (evt_tx, evt_rx) = std::sync::mpsc::channel::<AgentEvent>();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -355,5 +434,6 @@ pub fn spawn(agent: Agent) -> RuntimeHandle {
         cancel,
         provider_label,
         provider_names,
+        session_id,
     }
 }

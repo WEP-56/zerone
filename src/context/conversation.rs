@@ -23,6 +23,10 @@ impl Conversation {
         self.messages.push(m);
     }
 
+    pub fn from_messages(messages: Vec<ChatMessage>) -> Self {
+        Conversation { messages }
+    }
+
     pub fn clear(&mut self) {
         self.messages.clear();
     }

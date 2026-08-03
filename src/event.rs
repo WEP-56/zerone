@@ -13,6 +13,9 @@
 //! 因为取消必须能打断一个正忙着读流/跑子进程的 Runtime,
 //! 而它忙的时候不会回来看命令通道。
 
+use crate::message::ChatMessage;
+use crate::storage::SessionSummary;
+
 /// 前端 → Runtime。
 #[derive(Debug, Clone)]
 pub enum AgentCommand {
@@ -24,6 +27,10 @@ pub enum AgentCommand {
     SwitchProvider(String),
     /// 覆盖当前 provider 的模型名(/model)。
     SetModel(String),
+    /// 列出当前 workspace 的历史会话(/session)。
+    ListSessions,
+    /// 恢复当前 workspace 的一个历史会话(/session <id>)。
+    LoadSession(String),
     /// 退出:Runtime 线程收到后结束自己。
     Shutdown,
 }
@@ -75,6 +82,18 @@ pub enum AgentEvent {
     ConversationCleared,
     /// provider/模型已变化,`label` 是新的显示名(状态栏用)。
     ProviderChanged { label: String },
+    /// 当前 workspace 的会话列表。
+    SessionsListed {
+        current_id: String,
+        sessions: Vec<SessionSummary>,
+    },
+    /// 历史会话已载入；前端据此重建对话画面。
+    SessionLoaded {
+        id: String,
+        messages: Vec<ChatMessage>,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     /// 本轮出错终止(HTTP 错误、流解析失败……)。会话仍可继续用。
     Error(String),
 

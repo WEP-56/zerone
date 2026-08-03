@@ -295,7 +295,7 @@ fn build_invocation(shell: &Shell, command: &str) -> Result<(Command, Option<Pat
 fn temp_script_path(ext: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("harness-cmd-{}-{}.{}", std::process::id(), n, ext))
+    std::env::temp_dir().join(format!("zerone-cmd-{}-{}.{}", std::process::id(), n, ext))
 }
 
 fn spawn_pipe_reader<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
@@ -333,11 +333,11 @@ mod tests {
     fn echo_roundtrip() {
         let tool = RunCommand::new(detect_shell("auto"));
         let r = tool.execute(
-            &json!({"command": "echo hello-harness"}),
+            &json!({"command": "echo hello-zerone"}),
             &ws(),
             &AtomicBool::new(false),
         );
-        assert!(r.as_ref().unwrap().contains("hello-harness"), "{:?}", r);
+        assert!(r.as_ref().unwrap().contains("hello-zerone"), "{:?}", r);
     }
 
     #[test]

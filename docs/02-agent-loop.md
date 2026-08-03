@@ -87,13 +87,15 @@ emit TurnFinished
 方向 | 类型 | 说明
 ---|---|---
 前端→Runtime | `UserInput` | 开启一轮
- | `ClearConversation` / `SwitchProvider` / `SetModel` | 会话管理(命令在通道里排队,turn 进行中会等它结束)
+ | `ClearConversation` / `SwitchProvider` / `SetModel` | 会话与 provider 管理(命令在通道里排队,turn 进行中会等它结束)
+ | `ListSessions` / `LoadSession` | 按当前 workspace 列出/恢复 SQLite 会话
  | `Shutdown` | Runtime 线程退出
 Runtime→前端 | `UserMessage` | 回显(前端不自己上屏,统一走事件,保证 headless 一致)
  | `TurnStarted` / `TurnFinished{cancelled}` | 轮次边界
  | `AssistantDelta` / `ThinkingDelta` / `AssistantMessage` | 流式文本(Message 是全文,前端用来兜底校正)
  | `ToolCallPending` / `ToolCallStarted` / `ToolCallFinished` | 工具生命周期(Pending 仅状态栏,参数还在流式拼接)
  | `Usage` | 会话累计 token
+ | `SessionsListed` / `SessionLoaded` | 会话列表/用于重建前端的完整历史
  | `Notice` / `Error` / `ConversationCleared` / `ProviderChanged` | 其他
 
 `main.rs::run_once` 用五十行就把同一事件流变成了命令行输出——
@@ -110,5 +112,5 @@ Runtime→前端 | `UserMessage` | 回显(前端不自己上屏,统一走事件,
 | 上下文压缩 | `Conversation::contribute`(见 05) |
 | 权限/审批 | `ToolRegistry::execute` 之前(见 03) |
 | 子代理 | Runtime 本身就是"命令进事件出"的独立单元,递归 spawn 即可 |
-| 会话持久化 | `ChatMessage` 已 derive Serialize,把 `Conversation` 落盘即可 |
+| 存储迁移与修复 | 已有一会话一 SQLite 库；下一步给 `storage.rs` 加 schema version、迁移和损坏诊断 |
 | 队列化多轮任务 | 前端把输入排队,`TurnFinished` 后发下一条 |

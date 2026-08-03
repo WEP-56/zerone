@@ -1,6 +1,6 @@
 //! # 统一消息模型(全项目的"通用语言")
 //!
-//! 这是整个 harness 最重要的设计决策:**内部只用一套消息表示**。
+//! 这是 Zerone 最重要的设计决策:**内部只用一套消息表示**。
 //!
 //! 三种 API(Anthropic Messages / OpenAI Chat Completions / OpenAI Responses)
 //! 的报文格式差异很大,但语义上都是同一件事:

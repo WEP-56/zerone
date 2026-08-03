@@ -11,19 +11,20 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::{bail, Result};
 
-use harness::config::{Config, EXAMPLE_CONFIG};
-use harness::event::{AgentCommand, AgentEvent};
-use harness::runtime::{self, Agent};
-use harness::workspace::Workspace;
+use zerone::config::{Config, EXAMPLE_CONFIG};
+use zerone::event::{AgentCommand, AgentEvent};
+use zerone::runtime::{self, Agent};
+use zerone::storage::AppPaths;
+use zerone::workspace::Workspace;
 
-const HELP: &str = "harness —— 极小但结构正确的 Agent Harness
+const HELP: &str = "Zerone —— 从零到一的 Coding Agent
 
 用法:
-  harness                     启动 TUI
-  harness --once <提示词...>   无界面跑一轮(方便调试/脚本化)
+  zerone                     启动 TUI
+  zerone --once <提示词...>   无界面跑一轮(方便调试/脚本化)
 
 选项:
-  -c, --config <路径>    配置文件(默认 ./config.toml,不存在会生成模板)
+  -c, --config <路径>    配置文件(默认 ~/.zerone/config.toml,不存在会生成模板)
   -p, --provider <名字>  覆盖 [agent].provider
   -h, --help             显示本帮助
 ";
@@ -34,8 +35,8 @@ struct Args {
     once: Option<String>,
 }
 
-fn parse_args() -> Result<Option<Args>> {
-    let mut config = PathBuf::from("config.toml");
+fn parse_args(default_config: PathBuf) -> Result<Option<Args>> {
+    let mut config = default_config;
     let mut provider = None;
     let mut once = None;
     let mut it = std::env::args().skip(1);
@@ -73,16 +74,21 @@ fn parse_args() -> Result<Option<Args>> {
 }
 
 fn main() -> Result<()> {
-    let Some(args) = parse_args()? else {
+    let paths = AppPaths::discover()?;
+    let Some(args) = parse_args(paths.config.clone())? else {
         print!("{}", HELP);
         return Ok(());
     };
+    paths.ensure()?;
 
     // 首次运行:生成配置模板后退出,提示用户填 key
     if !args.config.exists() {
+        if let Some(parent) = args.config.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(&args.config, EXAMPLE_CONFIG)?;
         println!(
-            "已生成配置模板 {}。\n填好 API key(或设置对应环境变量)后重新运行 harness。",
+            "已生成 Zerone 配置模板 {}。\n填好 API key(或设置对应环境变量)后重新运行 zerone。",
             args.config.display()
         );
         return Ok(());
@@ -100,7 +106,7 @@ fn main() -> Result<()> {
 
     match args.once {
         Some(prompt) => run_once(agent, prompt),
-        None => harness::tui::run(runtime::spawn(agent)),
+        None => zerone::tui::run(runtime::spawn(agent)),
     }
 }
 
@@ -134,7 +140,7 @@ fn run_once(mut agent: Agent, prompt: String) -> Result<()> {
                 eprintln!(
                     "  └ {}{}{}",
                     if is_error { "✖ " } else { "" },
-                    harness::util::ellipsis(first, 120),
+                    zerone::util::ellipsis(first, 120),
                     if more > 0 {
                         format!(" (+{} 行)", more)
                     } else {

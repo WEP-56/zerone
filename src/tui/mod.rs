@@ -18,16 +18,19 @@
 //!   在粘贴。识别粘贴必须把积压事件取出来看内容(见 `enter_means_newline`),
 //!   否则 Enter 永远发不出消息;
 //! - 传统控制台没有括号粘贴(bracketed paste),多行粘贴会变成一串
-//!   带 Enter 的按键;同样靠上面的内容检查兜底。
+//!   带 Enter 的按键;同样靠上面的内容检查兜底;
+//! - 必须启用鼠标捕获:否则滚轮会被终端翻译成 ↑/↓ 方向键,误触输入历史;
+//!   捕获后滚轮事件只用来滚动聊天区,↑/↓ 留给输入历史/多行移动。
 
 mod input;
 mod transcript;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -37,6 +40,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::event::{AgentCommand, AgentEvent};
+use crate::message::{Block as MessageBlock, ChatMessage, Role};
 use crate::runtime::RuntimeHandle;
 use crate::util;
 use input::InputBox;
@@ -45,30 +49,37 @@ use transcript::Transcript;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// 输入区内容最多显示的行数(超出滚动)。
 const INPUT_MAX_ROWS: usize = 6;
+/// 滚轮每格滚动的行数(比 PgUp/PgDn 的半屏步长更细腻)。
+const MOUSE_SCROLL_STEP: usize = 3;
 
 const HELP_TEXT: &str = "可用命令:\n\
   /help              显示本帮助\n\
   /clear             清空会话(历史与画面)\n\
+  /session           列出当前 workspace 的历史会话\n\
+  /session ID        恢复历史会话(ID 可只输入唯一前缀)\n\
   /provider          列出可用 provider\n\
   /provider 名字     切换 provider(对话历史保留)\n\
   /model 模型名      修改当前 provider 的模型\n\
   /quit              退出\n\
 按键:Enter 发送 · 换行用「行尾 \\ 再回车」(Shift+Enter 仅部分终端支持) · \
-Esc 取消当前轮/回到底部 · PgUp/PgDn 滚动 · ↑/↓ 输入历史 · Ctrl+C×2 退出";
+Esc 取消当前轮/回到底部 · PgUp/PgDn/滚轮 滚动聊天区 · ↑/↓ 输入历史 · Ctrl+C×2 退出";
 
 pub fn run(handle: RuntimeHandle) -> anyhow::Result<()> {
     let mut terminal = ratatui::init(); // 含 raw mode、备用屏、panic 钩子
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
 
     let mut app = App::new(handle);
     app.transcript.push_notice(format!(
-        "harness 已就绪({}),输入内容开始对话,/help 查看命令",
-        app.provider_label
+        "Zerone 已就绪({}) · 会话 {},输入内容开始对话,/help 查看命令",
+        app.provider_label,
+        short_id(&app.session_id)
     ));
 
     let result = app.event_loop(&mut terminal);
 
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -89,6 +100,7 @@ struct App {
     busy: bool,
     status_note: String,
     provider_label: String,
+    session_id: String,
     usage: (u64, u64),
     scroll_up: usize,
     last_transcript_height: u16,
@@ -103,6 +115,7 @@ struct App {
 impl App {
     fn new(handle: RuntimeHandle) -> App {
         let provider_label = handle.provider_label.clone();
+        let session_id = handle.session_id.clone();
         App {
             handle,
             transcript: Transcript::default(),
@@ -114,6 +127,7 @@ impl App {
             busy: false,
             status_note: String::new(),
             provider_label,
+            session_id,
             usage: (0, 0),
             scroll_up: 0,
             last_transcript_height: 20,
@@ -185,8 +199,25 @@ impl App {
     fn on_terminal_event(&mut self, ev: Event) {
         match ev {
             Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k.code, k.modifiers),
+            Event::Mouse(m) => self.on_mouse(m),
             Event::Paste(s) => self.input.insert_str(&s),
             Event::Resize(_, _) => {}
+            _ => {}
+        }
+    }
+
+    /// 滚轮只滚动聊天区,绝不碰输入历史。
+    /// 上滚 = 从底部往上翻(增大 scroll_up),下滚 = 回到底部方向。
+    /// 底部钳制交给 draw 里的 visible_lines(渲染时统一处理)。
+    fn on_mouse(&mut self, m: ratatui::crossterm::event::MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_up = self.scroll_up.saturating_add(MOUSE_SCROLL_STEP);
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_up = self.scroll_up.saturating_sub(MOUSE_SCROLL_STEP);
+            }
+            // 水平滚轮/点击/拖拽暂不处理
             _ => {}
         }
     }
@@ -230,12 +261,103 @@ impl App {
             AgentEvent::ProviderChanged { label } => {
                 self.provider_label = label;
             }
+            AgentEvent::SessionsListed {
+                current_id,
+                sessions,
+            } => {
+                let mut lines = vec!["当前 workspace 的会话:".to_string()];
+                for session in sessions {
+                    let marker = if session.id == current_id { "*" } else { " " };
+                    let title = if session.title.is_empty() {
+                        "(空会话)"
+                    } else {
+                        &session.title
+                    };
+                    lines.push(format!(
+                        "{} {}  {:>3} 条  {}",
+                        marker,
+                        short_id(&session.id),
+                        session.message_count,
+                        title
+                    ));
+                }
+                lines.push("使用 /session ID 恢复，ID 可输入上面显示的前缀".into());
+                self.transcript.push_notice(lines.join("\n"));
+            }
+            AgentEvent::SessionLoaded {
+                id,
+                messages,
+                input_tokens,
+                output_tokens,
+            } => {
+                self.session_id = id;
+                self.usage = (input_tokens, output_tokens);
+                self.restore_transcript(&messages);
+                self.transcript.push_notice(format!(
+                    "已恢复会话 {}({} 条历史消息)",
+                    short_id(&self.session_id),
+                    messages.len()
+                ));
+                self.scroll_up = 0;
+            }
             AgentEvent::TurnFinished { cancelled } => {
                 self.busy = false;
                 self.status_note.clear();
                 self.transcript.close_open_cells();
                 if cancelled {
                     self.transcript.push_notice("已取消".into());
+                }
+            }
+        }
+    }
+
+    fn restore_transcript(&mut self, messages: &[ChatMessage]) {
+        let results: HashMap<&str, (&str, bool)> = messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                MessageBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => Some((tool_use_id.as_str(), (content.as_str(), *is_error))),
+                _ => None,
+            })
+            .collect();
+
+        self.transcript.clear();
+        for message in messages {
+            match message.role {
+                Role::User => {
+                    for block in &message.blocks {
+                        if let MessageBlock::Text(text) = block {
+                            self.transcript.push_user(text.clone());
+                        }
+                    }
+                }
+                Role::Assistant => {
+                    for block in &message.blocks {
+                        match block {
+                            MessageBlock::Text(text) => {
+                                self.transcript.append_assistant(text);
+                            }
+                            MessageBlock::Thinking { text, .. } if !text.is_empty() => {
+                                self.transcript.append_thinking(text);
+                            }
+                            MessageBlock::ToolUse { id, name, input } => {
+                                self.transcript
+                                    .push_tool(name.clone(), util::args_summary(input));
+                                if let Some((output, is_error)) = results.get(id.as_str()) {
+                                    self.transcript.finish_tool(
+                                        util::truncate_middle(output, 4000),
+                                        *is_error,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.transcript.close_open_cells();
                 }
             }
         }
@@ -413,6 +535,16 @@ impl App {
                 // 命令走通道排队,真正清空以 ConversationCleared 事件为准
                 let _ = self.handle.commands.send(AgentCommand::ClearConversation);
             }
+            "session" => {
+                if rest.is_empty() {
+                    let _ = self.handle.commands.send(AgentCommand::ListSessions);
+                } else {
+                    let _ = self
+                        .handle
+                        .commands
+                        .send(AgentCommand::LoadSession(rest.to_string()));
+                }
+            }
             "provider" => {
                 if rest.is_empty() {
                     self.transcript.push_notice(format!(
@@ -576,6 +708,10 @@ impl App {
     }
 }
 
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,6 +735,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             provider_label: "mock / test-model".into(),
             provider_names: vec!["mock".into()],
+            session_id: "12345678-1234-1234-1234-123456789abc".into(),
         };
         (App::new(handle), evt_tx, cmd_rx)
     }
@@ -677,6 +814,38 @@ mod tests {
         assert!(app.scroll_up < 10_000, "渲染后 scroll 应被钳制");
     }
 
+    /// 滚轮滚动聊天区:上滚增大 scroll_up,下滚减小,底部不会欠账;
+    /// 与输入历史(↑/↓)完全隔离。
+    #[test]
+    fn mouse_wheel_scrolls_transcript() {
+        use ratatui::crossterm::event::MouseEvent;
+
+        let (mut app, _evt, _cmd) = dummy_app();
+        for i in 0..30 {
+            app.on_agent_event(AgentEvent::Notice(format!("第 {} 条", i)));
+        }
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(app.scroll_up, 0, "初始贴底");
+        app.on_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll_up, MOUSE_SCROLL_STEP, "上滚一格 = 上翻一步");
+        app.on_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll_up, 0, "下滚一格回到底部");
+
+        // 底部继续下滚:不产生负数
+        app.on_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll_up, 0);
+
+        // 上滚后输入历史不受影响(↑/↓ 才管历史)
+        app.on_mouse(wheel(MouseEventKind::ScrollUp));
+        assert!(app.history.is_empty(), "滚轮不应写入输入历史");
+    }
+
     /// Enter 必须发送——即使事件队列里躺着 Release 噪音(conpty 终端
     /// 会把按下/抬起同时入队,这曾导致 Enter 永远被当成换行)。
     #[test]
@@ -689,6 +858,19 @@ mod tests {
         match cmd.try_recv() {
             Ok(AgentCommand::UserInput(t)) => assert_eq!(t, "你好"),
             other => panic!("应收到 UserInput,得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn session_slash_commands_are_forwarded() {
+        let (mut app, _evt, cmd) = dummy_app();
+        app.handle_slash("session");
+        assert!(matches!(cmd.recv().unwrap(), AgentCommand::ListSessions));
+
+        app.handle_slash("session abc12345");
+        match cmd.recv().unwrap() {
+            AgentCommand::LoadSession(id) => assert_eq!(id, "abc12345"),
+            other => panic!("应收到 LoadSession，得到 {:?}", other),
         }
     }
 

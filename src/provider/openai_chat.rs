@@ -17,6 +17,7 @@
 //! - 工具结果没有 is_error 字段,错误以 `ERROR:` 前缀文本表达;
 //! - `Block::Thinking` 不回传(DeepSeek 明确要求不要把 reasoning 传回去)。
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{json, Value};
@@ -45,6 +46,9 @@ impl ChatProvider {
 
     fn build_body(&self, prompt: &PromptContext, tools: &[ToolSpec]) -> Value {
         let mut messages: Vec<Value> = Vec::new();
+        // 只为已编码的有效 ToolUse 发送结果。旧版本可能把稀疏 index 补成
+        // name="" 的占位调用；在这里过滤，可让已被污染的会话自行恢复。
+        let mut valid_tool_call_ids: HashSet<String> = HashSet::new();
         let system = prompt.system_text();
         if !system.is_empty() {
             messages.push(json!({"role": "system", "content": system}));
@@ -61,6 +65,9 @@ impl ChatProvider {
                             is_error,
                         } = b
                         {
+                            if !valid_tool_call_ids.remove(tool_use_id) {
+                                continue;
+                            }
                             let text = if *is_error {
                                 format!("ERROR: {}", content)
                             } else {
@@ -85,14 +92,19 @@ impl ChatProvider {
                         .blocks
                         .iter()
                         .filter_map(|b| match b {
-                            Block::ToolUse { id, name, input } => Some(json!({
-                                "id": id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": args_to_string(input),
-                                },
-                            })),
+                            Block::ToolUse { id, name, input }
+                                if !id.trim().is_empty() && !name.trim().is_empty() =>
+                            {
+                                valid_tool_call_ids.insert(id.clone());
+                                Some(json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": args_to_string(input),
+                                    },
+                                }))
+                            }
                             _ => None,
                         })
                         .collect();
@@ -147,10 +159,114 @@ impl ChatProvider {
 /// 流式拼装中的一次工具调用。
 #[derive(Default)]
 struct PendingCall {
+    /// 流中的逻辑位置。兼容服务不一定从 0 开始，也不一定连续。
+    stream_index: Option<u64>,
     id: String,
     name: String,
     args: String,
     announced: bool,
+}
+
+/// 合并一个 `tool_calls[]` 增量，返回首次得到的工具名供 UI 提示。
+///
+/// 不能用 index 直接扩容 Vec：有些兼容服务从 1 开始编号，扩容会制造一个
+/// 空的 index=0 占位调用，随后污染历史并让下一次请求永久 400。
+fn merge_tool_call_delta(calls: &mut Vec<PendingCall>, tc: &Value) -> Option<String> {
+    let index = tc["index"]
+        .as_u64()
+        .or_else(|| tc["index"].as_str().and_then(|s| s.parse().ok()));
+    let incoming_id = tc["id"].as_str().filter(|id| !id.is_empty());
+
+    let position = index
+        .and_then(|wanted| {
+            calls
+                .iter()
+                .position(|call| call.stream_index == Some(wanted))
+        })
+        .or_else(|| incoming_id.and_then(|wanted| calls.iter().position(|call| call.id == wanted)))
+        .or_else(|| {
+            if index.is_none() && incoming_id.is_none() {
+                calls.len().checked_sub(1)
+            } else {
+                None
+            }
+        });
+
+    let position = match position {
+        Some(position) => position,
+        None => {
+            calls.push(PendingCall {
+                stream_index: index,
+                ..PendingCall::default()
+            });
+            calls.len() - 1
+        }
+    };
+    let call = &mut calls[position];
+    if call.stream_index.is_none() {
+        call.stream_index = index;
+    }
+    if let Some(id) = incoming_id {
+        call.id = id.to_string();
+    }
+
+    // 标准形状是 function.{name,arguments}；少数兼容服务会把两者平铺。
+    let function = tc
+        .get("function")
+        .filter(|value| value.is_object())
+        .unwrap_or(tc);
+    if let Some(name) = function["name"].as_str().filter(|name| !name.is_empty()) {
+        merge_name_fragment(&mut call.name, name);
+    }
+    if let Some(arguments) = function.get("arguments") {
+        if let Some(fragment) = arguments.as_str() {
+            call.args.push_str(fragment);
+        } else if !arguments.is_null() {
+            call.args.push_str(&arguments.to_string());
+        }
+    }
+    if !call.announced && !call.name.is_empty() {
+        call.announced = true;
+        Some(call.name.clone())
+    } else {
+        None
+    }
+}
+
+fn merge_name_fragment(current: &mut String, fragment: &str) {
+    if current.is_empty() || fragment.starts_with(current.as_str()) {
+        *current = fragment.to_string();
+    } else if fragment != current && !current.ends_with(fragment) {
+        current.push_str(fragment);
+    }
+}
+
+fn finish_tool_calls(calls: Vec<PendingCall>) -> Result<Vec<Block>, ProviderError> {
+    let mut blocks = Vec::with_capacity(calls.len());
+    for (position, call) in calls.into_iter().enumerate() {
+        if call.name.trim().is_empty() {
+            let index = call
+                .stream_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "未知".into());
+            return Err(ProviderError::fatal(format!(
+                "Chat Completions 返回了缺少 function.name 的工具调用(index={});\
+                 已丢弃本次 assistant 消息，会话仍可继续",
+                index
+            )));
+        }
+        blocks.push(Block::ToolUse {
+            // 个别服务不发 id:必须造一个,否则结果消息无法配对
+            id: if call.id.is_empty() {
+                format!("call_{}", position)
+            } else {
+                call.id
+            },
+            name: call.name,
+            input: parse_args(&call.args),
+        });
+    }
+    Ok(blocks)
 }
 
 impl Provider for ChatProvider {
@@ -243,30 +359,7 @@ impl Provider for ChatProvider {
 
             if let Some(tcs) = delta["tool_calls"].as_array() {
                 for tc in tcs {
-                    // index 缺失时:有新 id 就当新调用,否则落到最后一个
-                    let idx = tc["index"].as_u64().map(|n| n as usize).unwrap_or_else(|| {
-                        if tc["id"].as_str().is_some() || calls.is_empty() {
-                            calls.len()
-                        } else {
-                            calls.len() - 1
-                        }
-                    });
-                    while calls.len() <= idx {
-                        calls.push(PendingCall::default());
-                    }
-                    let call = &mut calls[idx];
-                    if let Some(id) = tc["id"].as_str() {
-                        call.id = id.to_string();
-                    }
-                    if let Some(name) = tc["function"]["name"].as_str() {
-                        call.name = name.to_string();
-                    }
-                    if let Some(a) = tc["function"]["arguments"].as_str() {
-                        call.args.push_str(a);
-                    }
-                    if !call.announced && !call.name.is_empty() {
-                        call.announced = true;
-                        let name = call.name.clone();
+                    if let Some(name) = merge_tool_call_delta(&mut calls, tc) {
                         on_event(ProviderEvent::ToolCallBegun { name });
                     }
                 }
@@ -285,19 +378,9 @@ impl Provider for ChatProvider {
         if !text.is_empty() {
             blocks.push(Block::Text(text));
         }
-        let has_calls = !calls.is_empty();
-        for (i, c) in calls.into_iter().enumerate() {
-            blocks.push(Block::ToolUse {
-                // 个别服务不发 id:必须造一个,否则结果消息无法配对
-                id: if c.id.is_empty() {
-                    format!("call_{}", i)
-                } else {
-                    c.id
-                },
-                name: c.name,
-                input: parse_args(&c.args),
-            });
-        }
+        let call_blocks = finish_tool_calls(calls)?;
+        let has_calls = !call_blocks.is_empty();
+        blocks.extend(call_blocks);
 
         let stop = if has_calls {
             StopReason::ToolUse
@@ -386,6 +469,14 @@ mod tests {
     fn tool_error_gets_prefix() {
         let mut prompt = PromptContext::default();
         prompt.messages.push(ChatMessage {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: "c1".into(),
+                name: "read_file".into(),
+                input: json!({"path": "missing.txt"}),
+            }],
+        });
+        prompt.messages.push(ChatMessage {
             role: Role::User,
             blocks: vec![Block::ToolResult {
                 tool_use_id: "c1".into(),
@@ -394,9 +485,79 @@ mod tests {
             }],
         });
         let body = provider().build_body(&prompt, &[]);
-        assert!(body["messages"][0]["content"]
+        assert!(body["messages"][1]["content"]
             .as_str()
             .unwrap()
             .starts_with("ERROR:"));
+    }
+
+    #[test]
+    fn one_based_sparse_index_does_not_create_empty_call() {
+        let mut calls = Vec::new();
+        let announced = merge_tool_call_delta(
+            &mut calls,
+            &json!({
+                "index": 1,
+                "id": "call_1",
+                "function": {"name": "read_file", "arguments": "{\"path\":"}
+            }),
+        );
+        assert_eq!(announced.as_deref(), Some("read_file"));
+        merge_tool_call_delta(
+            &mut calls,
+            &json!({"index": 1, "function": {"arguments": "\"README.md\"}"}}),
+        );
+
+        assert_eq!(calls.len(), 1, "稀疏 index 不应生成占位调用");
+        let blocks = finish_tool_calls(calls).unwrap();
+        match &blocks[0] {
+            Block::ToolUse { id, name, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "read_file");
+                assert_eq!(input, &json!({"path": "README.md"}));
+            }
+            other => panic!("应得到 ToolUse，实际为 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn missing_tool_name_is_rejected_before_reaching_runtime() {
+        let mut calls = Vec::new();
+        merge_tool_call_delta(
+            &mut calls,
+            &json!({"index": 0, "id": "bad", "function": {"arguments": "{}"}}),
+        );
+        let error = finish_tool_calls(calls).unwrap_err();
+        assert!(error.message.contains("缺少 function.name"));
+    }
+
+    #[test]
+    fn invalid_legacy_tool_pair_is_omitted_from_request_history() {
+        let mut prompt = PromptContext::default();
+        prompt.messages.push(ChatMessage::user_text("读取文件"));
+        prompt.messages.push(ChatMessage {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: "call_bad".into(),
+                name: "".into(),
+                input: json!({"path": "README.md"}),
+            }],
+        });
+        prompt.messages.push(ChatMessage {
+            role: Role::User,
+            blocks: vec![Block::ToolResult {
+                tool_use_id: "call_bad".into(),
+                content: "未知工具".into(),
+                is_error: true,
+            }],
+        });
+        prompt.messages.push(ChatMessage::user_text("继续"));
+
+        let body = provider().build_body(&prompt, &[]);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "读取文件");
+        assert_eq!(messages[1]["content"], "继续");
+        assert!(messages.iter().all(|message| message["role"] != "tool"));
     }
 }

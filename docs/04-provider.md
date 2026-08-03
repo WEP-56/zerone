@@ -87,8 +87,12 @@ Block::ToolResult { tool_use_id, content, is_error } // Observation(在 User 消
 - `message_delta.usage.output_tokens` 是**累计值**,直接覆盖。
 
 ### openai_chat.rs(兼容面最广,方言也最多)
-- 工具调用按 `index` 分片,id/name 只在首片;个别服务不发 index
-  (按"有新 id = 新调用"兜底)、不发 id(必须**造一个**,否则结果无法配对);
+- 工具调用按 `index` 分片,id/name 只在首片。`index` 只能当分片关联键:
+  兼容服务可能从 1 开始或产生稀疏编号,不能按数组下标补占位调用;
+  个别服务不发 index(按"有新 id = 新调用"兜底)、不发 id
+  (必须**造一个**,否则结果无法配对);
+- 缺少 `function.name` 的调用必须在进入 Runtime 前拒绝。请求编码还会跳过
+  旧版本留下的无效 ToolUse/ToolResult 对,使已经污染的会话可以继续使用;
 - 用量块 `choices` 是空数组——任何 `choices[0]` 的无脑索引都会 panic;
 - 纯工具调用的 assistant 消息 `content` 置 null;
 - `role:"tool"` 消息必须**紧跟**发起调用的 assistant 消息 → 编码 User

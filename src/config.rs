@@ -172,7 +172,7 @@ impl Config {
 }
 
 /// 首次运行时写出的模板(同时也是 config.example.toml 的内容)。
-pub const EXAMPLE_CONFIG: &str = r#"# harness 配置文件
+pub const EXAMPLE_CONFIG: &str = r#"# Zerone 全局配置文件(~/.zerone/config.toml)
 # [agent].provider 决定当前用哪个 [providers.*];TUI 里可用 /provider 名字 热切换。
 
 [agent]
@@ -191,7 +191,7 @@ api = "messages"
 base_url = "https://api.anthropic.com"
 model = "claude-sonnet-5"          # 也可: claude-opus-5 / claude-fable-5
 api_key_env = "ANTHROPIC_API_KEY"
-# api_key = "sk-ant-..."           # 不想用环境变量就直接写(config.toml 已被 .gitignore)
+# api_key = "sk-ant-..."           # 不想用环境变量就直接写(请保护好此文件)
 
 # ---- OpenAI Responses API(OpenAI 当前主推)----
 [providers.openai]

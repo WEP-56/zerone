@@ -12,7 +12,7 @@ pub struct Instructions {
 /// 默认系统提示。用英文写(模型对英文指令的服从性最稳),
 /// 但明确要求"跟随用户的语言回复"。
 const DEFAULT: &str = "\
-You are Harness, a coding agent running in a terminal.
+You are Zerone, a coding agent running in a terminal.
 
 Guidelines:
 - Use the provided tools to inspect and modify files and to run commands. \
