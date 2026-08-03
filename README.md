@@ -25,6 +25,13 @@ cargo run -- --once 你好    # 无界面跑一轮,最快的连通性测试
 cargo run -- -p deepseek   # 临时切换 provider
 ```
 
+发布 npm 包后也可以直接安装预编译版本，无需 Rust 工具链：
+
+```bash
+npm install --global zerone-agent
+zerone
+```
+
 代理走 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量;`base_url` 可指向任意兼容服务(中转、ollama、vLLM)。
 
 ## 按键与命令
@@ -35,8 +42,8 @@ cargo run -- -p deepseek   # 临时切换 provider
 | 行尾 `\` + Enter | 换行(Shift+Enter 仅部分终端;多行粘贴自动识别) | `/model 名` | 改模型 |
 | Esc | 取消当前轮 / 回底部 / 清输入 | `/session [ID]` | 列出/恢复当前 workspace 的会话 |
 | Ctrl+L | 强制重绘 | `/clear` | 清空当前会话 |
-| F2 | 进入/退出文字选择复制模式 | `/copy` | 进入文字选择复制模式 |
-| PgUp·PgDn / ↑·↓ | 滚动 / 输入历史 | `/help` `/quit` | 帮助 / 退出 |
+| 鼠标滚轮 / 拖动 | 浏览终端历史 / 选择文本 | `/clear` | 清空当前会话 |
+| PgUp·PgDn / ↑·↓ | 滚动当前输出 / 输入历史 | `/help` `/quit` | 帮助 / 退出 |
 | Ctrl+C ×2 | 退出(任何时候有效) | | |
 
 ## 结构与文档
@@ -60,3 +67,23 @@ tests/wire.rs    三接口 mock 集成测试(不碰真实网络)
 配置和会话位于用户目录的 `.zerone/`。每个会话保存为 `sessions/<uuid>.db`，
 并记录其 workspace；在同一路径启动 Zerone 后用 `/session` 查找，再用
 `/session ID` 恢复。可设置 `ZERONE_HOME` 覆盖数据目录，便于测试或便携安装。
+
+## 打包 npm
+
+本机构建当前平台并生成测试 tarball：
+
+```powershell
+.\scripts\package-npm.ps1 -Pack
+node .\dist\npm\package\bin\zerone.js --help
+```
+
+本地 tarball 只包含当前平台，不应作为跨平台正式版本发布。正式包通过 GitHub
+Actions 的 `Package npm release` workflow 构建 Windows x64、Linux x64(musl)、macOS
+x64/arm64；下载它生成的 `npm-package-*` artifact 后手动发布：
+
+```bash
+npm publish zerone-agent-0.1.0.tgz --access public
+```
+
+版本默认读取 `Cargo.toml`，也可以在手动运行 workflow 时覆盖包名和版本。npm
+包只包含 Node 启动器与预编译二进制，运行时仍是同一个 Rust `zerone` 进程。
