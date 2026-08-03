@@ -19,8 +19,8 @@
 //!   否则 Enter 永远发不出消息;
 //! - 传统控制台没有括号粘贴(bracketed paste),多行粘贴会变成一串
 //!   带 Enter 的按键;同样靠上面的内容检查兜底;
-//! - 必须启用鼠标捕获:否则滚轮会被终端翻译成 ↑/↓ 方向键,误触输入历史;
-//!   捕获后滚轮事件只用来滚动聊天区,↑/↓ 留给输入历史/多行移动。
+//! - 默认启用鼠标捕获:否则滚轮会被终端翻译成 ↑/↓ 方向键,误触输入历史;
+//!   `/copy`/F2 复制模式会临时关闭捕获并冻结画面,交还给终端原生拖选。
 
 mod input;
 mod transcript;
@@ -60,9 +60,10 @@ const HELP_TEXT: &str = "可用命令:\n\
   /provider          列出可用 provider\n\
   /provider 名字     切换 provider(对话历史保留)\n\
   /model 模型名      修改当前 provider 的模型\n\
+  /copy              进入终端原生文字选择模式(F2)\n\
   /quit              退出\n\
 按键:Enter 发送 · 换行用「行尾 \\ 再回车」(Shift+Enter 仅部分终端支持) · \
-Esc 取消当前轮/回到底部 · PgUp/PgDn/滚轮 滚动聊天区 · ↑/↓ 输入历史 · Ctrl+C×2 退出";
+Esc 取消当前轮/回到底部 · PgUp/PgDn/滚轮 滚动聊天区 · F2 选择复制 · ↑/↓ 输入历史 · Ctrl+C×2 退出";
 
 pub fn run(handle: RuntimeHandle) -> anyhow::Result<()> {
     let mut terminal = ratatui::init(); // 含 raw mode、备用屏、panic 钩子
@@ -110,6 +111,9 @@ struct App {
     quit_armed_at: Option<Instant>,
     should_quit: bool,
     force_clear: bool,
+    /// 复制模式关闭鼠标捕获，让终端接管拖选与 Ctrl+C。
+    copy_mode: bool,
+    mouse_capture_enabled: bool,
 }
 
 impl App {
@@ -136,6 +140,8 @@ impl App {
             quit_armed_at: None,
             should_quit: false,
             force_clear: false,
+            copy_mode: false,
+            mouse_capture_enabled: true,
         }
     }
 
@@ -145,7 +151,8 @@ impl App {
             // 1. 应用 Runtime 事件
             while let Ok(ev) = self.handle.events.try_recv() {
                 self.on_agent_event(ev);
-                dirty = true;
+                // 复制模式冻结画面，避免后台事件清掉终端原生选区。
+                dirty |= !self.copy_mode;
             }
             // 2. 终端输入:一帧内把积压处理干净(粘贴洪峰时避免一字符一帧),
             //    上限防止超大粘贴饿死渲染
@@ -158,18 +165,17 @@ impl App {
                 } else {
                     break;
                 };
-                self.on_terminal_event(ev);
-                dirty = true;
+                dirty |= self.on_terminal_event(ev);
                 budget -= 1;
             }
             // 空闲时阻塞等待(33ms 超时 ≈ 渲染节拍)
             if !dirty && event::poll(Duration::from_millis(33))? {
                 let ev = event::read()?;
-                self.on_terminal_event(ev);
-                dirty = true;
+                dirty |= self.on_terminal_event(ev);
             }
             // 3. 忙碌时转 spinner
-            if self.busy && self.last_spin.elapsed() > Duration::from_millis(100) {
+            if self.busy && !self.copy_mode && self.last_spin.elapsed() > Duration::from_millis(100)
+            {
                 self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
                 self.last_spin = Instant::now();
                 dirty = true;
@@ -181,6 +187,7 @@ impl App {
                     dirty = true;
                 }
             }
+            dirty |= self.sync_mouse_capture()?;
             // 4. 渲染
             if self.force_clear {
                 terminal.clear()?;
@@ -196,29 +203,59 @@ impl App {
         }
     }
 
-    fn on_terminal_event(&mut self, ev: Event) {
+    /// 返回是否真的改变了界面。未处理的鼠标移动/点击不再触发整屏重绘。
+    fn on_terminal_event(&mut self, ev: Event) -> bool {
         match ev {
-            Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k.code, k.modifiers),
+            Event::Key(k) if k.kind == KeyEventKind::Press => {
+                if self.copy_mode {
+                    if matches!(k.code, KeyCode::Esc | KeyCode::F(2)) {
+                        self.copy_mode = false;
+                        return true;
+                    }
+                    return false;
+                }
+                self.on_key(k.code, k.modifiers);
+                true
+            }
             Event::Mouse(m) => self.on_mouse(m),
-            Event::Paste(s) => self.input.insert_str(&s),
-            Event::Resize(_, _) => {}
-            _ => {}
+            Event::Paste(s) if !self.copy_mode => {
+                self.input.insert_str(&s);
+                true
+            }
+            Event::Resize(_, _) => true,
+            _ => false,
         }
+    }
+
+    fn sync_mouse_capture(&mut self) -> std::io::Result<bool> {
+        let wanted = !self.copy_mode;
+        if wanted == self.mouse_capture_enabled {
+            return Ok(false);
+        }
+        if wanted {
+            execute!(std::io::stdout(), EnableMouseCapture)?;
+        } else {
+            execute!(std::io::stdout(), DisableMouseCapture)?;
+        }
+        self.mouse_capture_enabled = wanted;
+        Ok(true)
     }
 
     /// 滚轮只滚动聊天区,绝不碰输入历史。
     /// 上滚 = 从底部往上翻(增大 scroll_up),下滚 = 回到底部方向。
     /// 底部钳制交给 draw 里的 visible_lines(渲染时统一处理)。
-    fn on_mouse(&mut self, m: ratatui::crossterm::event::MouseEvent) {
+    fn on_mouse(&mut self, m: ratatui::crossterm::event::MouseEvent) -> bool {
         match m.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_up = self.scroll_up.saturating_add(MOUSE_SCROLL_STEP);
+                true
             }
             MouseEventKind::ScrollDown => {
                 self.scroll_up = self.scroll_up.saturating_sub(MOUSE_SCROLL_STEP);
+                true
             }
             // 水平滚轮/点击/拖拽暂不处理
-            _ => {}
+            _ => false,
         }
     }
 
@@ -367,6 +404,7 @@ impl App {
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         match code {
+            KeyCode::F(2) => self.enter_copy_mode(),
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.on_ctrl_c(),
             KeyCode::Char('l') if mods.contains(KeyModifiers::CONTROL) => {
                 self.force_clear = true;
@@ -436,6 +474,15 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn enter_copy_mode(&mut self) {
+        if self.busy {
+            self.transcript
+                .push_notice("当前仍在生成，结束后再进入复制模式".into());
+        } else {
+            self.copy_mode = true;
         }
     }
 
@@ -545,6 +592,7 @@ impl App {
                         .send(AgentCommand::LoadSession(rest.to_string()));
                 }
             }
+            "copy" => self.enter_copy_mode(),
             "provider" => {
                 if rest.is_empty() {
                     self.transcript.push_notice(format!(
@@ -661,10 +709,12 @@ impl App {
             let rows: Vec<Line> = iv.rows.iter().map(|r| Line::raw(r.clone())).collect();
             frame.render_widget(Paragraph::new(rows), input_inner);
         }
-        frame.set_cursor_position((
-            input_inner.x + iv.cursor_col.min(input_inner.width.saturating_sub(1)),
-            input_inner.y + (iv.cursor_row as u16).min(input_inner.height.saturating_sub(1)),
-        ));
+        if !self.copy_mode {
+            frame.set_cursor_position((
+                input_inner.x + iv.cursor_col.min(input_inner.width.saturating_sub(1)),
+                input_inner.y + (iv.cursor_row as u16).min(input_inner.height.saturating_sub(1)),
+            ));
+        }
 
         // 状态栏
         frame.render_widget(self.status_line(), s_area);
@@ -694,7 +744,9 @@ impl App {
             ),
             dim,
         ));
-        let hint = if self.quit_armed_at.is_some() {
+        let hint = if self.copy_mode {
+            "│ 复制模式:拖动选择 · Ctrl+C 复制 · Esc 返回".to_string()
+        } else if self.quit_armed_at.is_some() {
             "│ 再按一次 Ctrl+C 退出".to_string()
         } else if self.scroll_up > 0 {
             format!("│ 已上翻 {} 行,Esc 回到底部", self.scroll_up)
@@ -872,6 +924,35 @@ mod tests {
             AgentCommand::LoadSession(id) => assert_eq!(id, "abc12345"),
             other => panic!("应收到 LoadSession，得到 {:?}", other),
         }
+    }
+
+    #[test]
+    fn copy_mode_freezes_input_until_escape() {
+        use ratatui::crossterm::event::KeyEvent;
+
+        let (mut app, _evt, _cmd) = dummy_app();
+        app.handle_slash("copy");
+        assert!(app.copy_mode);
+
+        let changed = app.on_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!changed);
+        assert!(app.input.is_empty(), "复制模式不应把快捷键写进输入框");
+
+        let changed =
+            app.on_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(changed);
+        assert!(!app.copy_mode);
+    }
+
+    #[test]
+    fn copy_mode_waits_for_active_turn() {
+        let (mut app, _evt, _cmd) = dummy_app();
+        app.busy = true;
+        app.on_key(KeyCode::F(2), KeyModifiers::NONE);
+        assert!(!app.copy_mode);
     }
 
     /// 行尾反斜杠 + Enter = 续行,不发送;下一次 Enter 正常发送多行内容。

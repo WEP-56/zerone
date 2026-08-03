@@ -33,6 +33,7 @@ cargo run -- -p deepseek   # 临时切换 provider
 | 行尾 `\` + Enter | 换行(Shift+Enter 仅部分终端;多行粘贴自动识别) | `/model 名` | 改模型 |
 | Esc | 取消当前轮 / 回底部 / 清输入 | `/session [ID]` | 列出/恢复当前 workspace 的会话 |
 | Ctrl+L | 强制重绘 | `/clear` | 清空当前会话 |
+| F2 | 进入/退出文字选择复制模式 | `/copy` | 进入文字选择复制模式 |
 | PgUp·PgDn / ↑·↓ | 滚动 / 输入历史 | `/help` `/quit` | 帮助 / 退出 |
 | Ctrl+C ×2 | 退出(任何时候有效) | | |
 
