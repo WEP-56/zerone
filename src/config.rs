@@ -133,6 +133,16 @@ impl Config {
         self.providers.keys().cloned().collect()
     }
 
+    /// TUI model picker 的初始目录。这里只暴露已配置的模型名，不猜测远端服务目录。
+    pub fn model_names(&self) -> Vec<String> {
+        self.providers
+            .values()
+            .map(|provider| provider.model.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// 把某个 profile 解析成可用设置(含 key 查找)。
     pub fn resolve_provider(&self, name: &str) -> Result<ProviderSettings> {
         let sec = self.providers.get(name).ok_or_else(|| {

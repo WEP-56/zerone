@@ -6,7 +6,7 @@
 
 use unicode_width::UnicodeWidthChar;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct InputBox {
     text: String,
     /// 字节偏移,总是位于字符边界。
@@ -23,6 +23,14 @@ pub struct InputView {
 }
 
 impl InputBox {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
@@ -108,6 +116,62 @@ impl InputBox {
         if let Some(next) = self.next_boundary() {
             self.cursor = next;
         }
+    }
+
+    pub fn move_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_end_all(&mut self) {
+        self.cursor = self.text.len();
+    }
+
+    pub fn move_word_left(&mut self) {
+        while let Some(prev) = self.prev_boundary() {
+            let c = self.text[prev..self.cursor].chars().next().unwrap_or(' ');
+            if !c.is_whitespace() {
+                break;
+            }
+            self.cursor = prev;
+        }
+        while let Some(prev) = self.prev_boundary() {
+            let c = self.text[prev..self.cursor].chars().next().unwrap_or(' ');
+            if c.is_whitespace() {
+                break;
+            }
+            self.cursor = prev;
+        }
+    }
+
+    pub fn move_word_right(&mut self) {
+        while let Some(next) = self.next_boundary() {
+            let c = self.text[self.cursor..next].chars().next().unwrap_or(' ');
+            if c.is_whitespace() {
+                break;
+            }
+            self.cursor = next;
+        }
+        while let Some(next) = self.next_boundary() {
+            let c = self.text[self.cursor..next].chars().next().unwrap_or(' ');
+            if !c.is_whitespace() {
+                break;
+            }
+            self.cursor = next;
+        }
+    }
+
+    pub fn delete_word_left(&mut self) {
+        let end = self.cursor;
+        self.move_word_left();
+        self.text.replace_range(self.cursor..end, "");
+    }
+
+    pub fn delete_to_line_end(&mut self) {
+        let end = self.text[self.cursor..]
+            .find('\n')
+            .map(|offset| self.cursor + offset)
+            .unwrap_or(self.text.len());
+        self.text.replace_range(self.cursor..end, "");
     }
 
     /// 到当前逻辑行行首。
@@ -268,5 +332,16 @@ mod tests {
         b.move_vertical(true);
         b.insert_char('!');
         assert_eq!(b.text, "ab!cd\nxy");
+    }
+
+    #[test]
+    fn word_navigation_and_deletion_are_utf8_safe() {
+        let mut b = InputBox::default();
+        b.insert_str("hello 世界 test");
+        b.move_word_left();
+        b.delete_word_left();
+        assert_eq!(b.text(), "hello test");
+        b.delete_to_line_end();
+        assert_eq!(b.text(), "hello ");
     }
 }

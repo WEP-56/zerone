@@ -396,6 +396,8 @@ pub struct RuntimeHandle {
     pub cancel: Arc<AtomicBool>,
     pub provider_label: String,
     pub provider_names: Vec<String>,
+    /// 配置文件中出现过的模型，供 TUI 提供真实而有限的选择目录。
+    pub model_names: Vec<String>,
     pub session_id: String,
 }
 
@@ -404,6 +406,7 @@ pub struct RuntimeHandle {
 pub fn spawn(agent: Agent) -> RuntimeHandle {
     let provider_label = agent.provider_label();
     let provider_names = agent.config.provider_names();
+    let model_names = agent.config.model_names();
     let session_id = agent.session_id().to_string();
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<AgentCommand>();
     let (evt_tx, evt_rx) = std::sync::mpsc::channel::<AgentEvent>();
@@ -434,6 +437,7 @@ pub fn spawn(agent: Agent) -> RuntimeHandle {
         cancel,
         provider_label,
         provider_names,
+        model_names,
         session_id,
     }
 }

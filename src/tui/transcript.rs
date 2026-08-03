@@ -82,6 +82,27 @@ struct LayoutCache {
 }
 
 impl Transcript {
+    /// Move the finalized prefix into terminal scrollback. Open streaming cells and anything
+    /// after them stay in the inline viewport until their turn is complete.
+    pub fn drain_finalized_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        let finalized = self
+            .entries
+            .iter()
+            .take_while(|entry| cell_is_finalized(&entry.cell))
+            .count();
+        if finalized == 0 {
+            return Vec::new();
+        }
+
+        let mut lines = Vec::new();
+        for entry in self.entries.iter_mut().take(finalized) {
+            lines.extend(entry.lines(width).iter().cloned());
+        }
+        self.entries.drain(..finalized);
+        self.layout = LayoutCache::default();
+        lines
+    }
+
     pub fn push_user(&mut self, text: String) {
         self.entries.push(Entry::new(Cell::User(text)));
         self.invalidate_layout();
@@ -269,6 +290,14 @@ impl Transcript {
     }
 }
 
+fn cell_is_finalized(cell: &Cell) -> bool {
+    match cell {
+        Cell::User(_) | Cell::Notice(_) | Cell::Error(_) => true,
+        Cell::Assistant { open, .. } | Cell::Thinking { open, .. } => !open,
+        Cell::Tool { output, .. } => output.is_some(),
+    }
+}
+
 // ---- 排版 ----
 
 fn style_user() -> Style {
@@ -419,5 +448,23 @@ mod tests {
         assert_eq!(transcript.layout_rebuilds, 2);
         transcript.visible_lines(60, 20, 0);
         assert_eq!(transcript.layout_rebuilds, 3, "宽度变化必须重新换行");
+    }
+
+    #[test]
+    fn drains_only_the_finalized_prefix() {
+        let mut transcript = Transcript::default();
+        transcript.push_user("hello".into());
+        transcript.append_assistant("streaming");
+        transcript.push_notice("after open cell".into());
+
+        let first = transcript.drain_finalized_lines(40);
+        assert!(format!("{first:?}").contains("hello"));
+        assert!(transcript.drain_finalized_lines(40).is_empty());
+
+        transcript.close_open_cells();
+        let rest = transcript.drain_finalized_lines(40);
+        let rendered = format!("{rest:?}");
+        assert!(rendered.contains("streaming"));
+        assert!(rendered.contains("after open cell"));
     }
 }
