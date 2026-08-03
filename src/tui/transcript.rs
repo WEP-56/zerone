@@ -467,4 +467,20 @@ mod tests {
         assert!(rendered.contains("streaming"));
         assert!(rendered.contains("after open cell"));
     }
+
+    #[test]
+    fn finalizing_cjk_text_does_not_insert_spaces() {
+        let mut transcript = Transcript::default();
+        transcript.append_assistant("完成。提交信息");
+        transcript.finalize_assistant("完成。提交信息".into());
+
+        let lines = transcript.drain_finalized_lines(40);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("完成。提交信息"));
+        assert!(!text.contains("完 成"));
+    }
 }

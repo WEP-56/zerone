@@ -39,6 +39,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use ratatui::{Frame, TerminalOptions, Viewport};
+use unicode_width::UnicodeWidthStr;
 
 use crate::event::{AgentCommand, AgentEvent};
 use crate::message::{Block as MessageBlock, ChatMessage, Role};
@@ -51,6 +52,8 @@ use transcript::Transcript;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// 输入区内容最多显示的行数(超出滚动)。
 const INPUT_MAX_ROWS: usize = 6;
+/// Inline viewport 只承载 live 内容和 composer；已完成消息在原生 scrollback 中。
+const INLINE_VIEWPORT_ROWS: u16 = 8;
 const HELP_TEXT: &str = "斜杠命令\n\
   /model             选择或输入模型\n\
   /provider          选择 provider(对话历史保留)\n\
@@ -77,11 +80,7 @@ enum Overlay {
 
 pub fn run(handle: RuntimeHandle) -> anyhow::Result<()> {
     let (_, terminal_rows) = ratatui::crossterm::terminal::size()?;
-    let viewport_height = terminal_rows
-        .saturating_mul(2)
-        .div_ceil(3)
-        .clamp(8, 20)
-        .min(terminal_rows.max(1));
+    let viewport_height = INLINE_VIEWPORT_ROWS.min(terminal_rows.max(1));
     let mut terminal = ratatui::try_init_with_options(TerminalOptions {
         viewport: Viewport::Inline(viewport_height),
     })?;
@@ -227,6 +226,7 @@ impl App {
         let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         terminal.insert_before(height, move |buffer| {
             Paragraph::new(lines).render(buffer.area, buffer);
+            clear_wide_continuation_cells(buffer);
         })?;
         self.scroll_up = 0;
         Ok(true)
@@ -1111,6 +1111,28 @@ impl App {
     }
 }
 
+/// Ratatui 0.29 的 inline `insert_before` 会把临时 Buffer 的每一格都交给 backend，
+/// 不像正常 diff 渲染那样跳过宽字符的 continuation cell。把这些占位格改为空
+/// symbol，避免它们在中文字符的第二列重新打印一个空格。
+fn clear_wide_continuation_cells(buffer: &mut ratatui::buffer::Buffer) {
+    for y in buffer.area.top()..buffer.area.bottom() {
+        let mut continuation = 0usize;
+        for x in buffer.area.left()..buffer.area.right() {
+            if continuation > 0 {
+                if let Some(cell) = buffer.cell_mut((x, y)) {
+                    cell.set_symbol("");
+                }
+                continuation -= 1;
+                continue;
+            }
+            continuation = buffer
+                .cell((x, y))
+                .map(|cell| UnicodeWidthStr::width(cell.symbol()).saturating_sub(1))
+                .unwrap_or(0);
+        }
+    }
+}
+
 fn draw_model_input(frame: &mut Frame, area: Rect, input: &InputBox) {
     frame.render_widget(Clear, area);
     let block = Block::default()
@@ -1442,5 +1464,19 @@ mod tests {
         let content = format!("{:?}", term.backend().buffer());
         assert!(content.contains("选择模型"));
         assert!(content.contains("自定义模型"));
+    }
+
+    #[test]
+    fn scrollback_buffer_clears_wide_character_continuations() {
+        let area = Rect::new(0, 0, 8, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        Paragraph::new("完成").render(area, &mut buffer);
+
+        clear_wide_continuation_cells(&mut buffer);
+
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "完");
+        assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), "");
+        assert_eq!(buffer.cell((2, 0)).unwrap().symbol(), "成");
+        assert_eq!(buffer.cell((3, 0)).unwrap().symbol(), "");
     }
 }
