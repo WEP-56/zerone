@@ -1,0 +1,48 @@
+# harness 配置文件
+# [agent].provider 决定当前用哪个 [providers.*];TUI 里可用 /provider 名字 热切换。
+
+[agent]
+provider = "anthropic"
+# run_command 用的 shell:auto | gitbash | powershell | cmd
+# auto = 找到 Git Bash 就用它(模型对 bash 语法最熟),否则退回 PowerShell
+shell = "auto"
+# 一轮对话里最多连续调用模型的次数(防止失控空转)
+max_turns = 50
+# 想完全接管系统提示就取消下面的注释:
+# system_prompt = "You are ..."
+
+# ---- Anthropic Messages API ----
+[providers.anthropic]
+api = "messages"
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-5"          # 也可: claude-opus-5 / claude-fable-5
+api_key_env = "ANTHROPIC_API_KEY"
+# api_key = "sk-ant-..."           # 不想用环境变量就直接写(config.toml 已被 .gitignore)
+
+# ---- OpenAI Responses API(OpenAI 当前主推)----
+[providers.openai]
+api = "responses"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5"
+api_key_env = "OPENAI_API_KEY"
+
+# ---- 同一家也可以走 Chat Completions,对比学习用 ----
+[providers.openai-chat]
+api = "chat"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5"
+api_key_env = "OPENAI_API_KEY"
+
+# ---- Chat Completions 兼容服务举例:DeepSeek ----
+[providers.deepseek]
+api = "chat"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"            # deepseek-reasoner 可以看到思考流
+api_key_env = "DEEPSEEK_API_KEY"
+
+# ---- 本地模型举例:ollama(无需鉴权)----
+[providers.ollama]
+api = "chat"
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen3:8b"
+api_key = ""

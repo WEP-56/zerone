@@ -1,0 +1,23 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2021"
+description = "极小但结构正确的 Agent Harness 教学项目"
+
+[dependencies]
+# 错误处理:教学项目用 anyhow 保持噪音最低
+anyhow = "1"
+# 序列化:所有 API 报文与配置
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# HTTP:选阻塞式 ureq 而非 reqwest/tokio——没有异步运行时,数据流一眼可见
+ureq = "2"
+# TUI:只依赖 ratatui,crossterm 用它的 re-export,避免版本错配
+ratatui = "0.29"
+# 文本换行(正确处理 CJK 宽度)
+textwrap = "0.16"
+unicode-width = "0.2"
+
+[profile.release]
+strip = true
