@@ -1,6 +1,6 @@
 # zero to one
 
-这是一个极简但结构完整的**基底 Agent**(Rust)。是 Claude Code / Codex / Pi 这类 coding agent 的最小可运行雏形:一个正确的 Agent Loop + 五个工具 + 三种 LLM 接口的流式适配 + 一个简约 TUI,没有其他。
+这是一个极简但结构完整的**基底 Agent**(Rust)。在4300行左右代码下打造了一个非生产级的类 Claude Code / Codex / Pi 等coding agent 的最小可运行雏形:一个正确的 Agent Loop + 五个工具 + 三种 LLM 接口的流式适配 + 一个简约 TUI,没有其他。
 
 这个仓库其实更适合：在此项目的基础上，扩展其harness工程，制作一个属于自己的可靠的agent。而不是从零构建agent的教程，如果需要的话，请看：[abstract](abstract.md) 内推荐的教程
 
@@ -30,7 +30,7 @@ cargo run -- -p deepseek   # 临时切换 provider
 | 按键 | 作用 | 命令 | 作用 |
 |---|---|---|---|
 | Enter | 发送 | `/provider [名]` | 列出/热切换 provider(历史保留) |
-| Shift+Enter | 换行(多行粘贴自动识别) | `/model 名` | 改模型 |
+| 行尾 `\` + Enter | 换行(Shift+Enter 仅部分终端;多行粘贴自动识别) | `/model 名` | 改模型 |
 | Esc | 取消当前轮 / 回底部 / 清输入 | `/clear` | 清空会话 |
 | PgUp·PgDn / ↑·↓ | 滚动 / 输入历史 | `/help` `/quit` | 帮助 / 退出 |
 | Ctrl+C ×2 | 退出(任何时候有效) | | |

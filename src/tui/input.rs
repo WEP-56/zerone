@@ -78,6 +78,20 @@ impl InputBox {
         }
     }
 
+    /// 若缓冲区以 `\` 结尾,弹掉它并返回 true。
+    /// 供"行尾反斜杠 + Enter = 换行"的续行语法使用(tui/mod.rs)。
+    pub fn pop_trailing_backslash(&mut self) -> bool {
+        if self.text.ends_with('\\') {
+            self.text.pop();
+            if self.cursor > self.text.len() {
+                self.cursor = self.text.len();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn delete(&mut self) {
         if let Some(next) = self.next_boundary() {
             self.text.replace_range(self.cursor..next, "");

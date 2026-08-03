@@ -13,13 +13,17 @@
 //! Windows 特有的坑,这里都处理了:
 //! - crossterm 在 Windows 会同时上报按键的 Press/Release,必须只认 Press,
 //!   否则每个字都打两遍;
+//! - 在 conpty 终端(Windows Terminal / VS Code)里,一次按键的
+//!   Press+Release 是**同一瞬间**被合成出来的,队列里"有积压"不代表
+//!   在粘贴。识别粘贴必须把积压事件取出来看内容(见 `enter_means_newline`),
+//!   否则 Enter 永远发不出消息;
 //! - 传统控制台没有括号粘贴(bracketed paste),多行粘贴会变成一串
-//!   带 Enter 的按键;用"Enter 到来时事件队列里还有积压 → 视为粘贴的
-//!   换行而非发送"这个启发式兜底。
+//!   带 Enter 的按键;同样靠上面的内容检查兜底。
 
 mod input;
 mod transcript;
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -49,8 +53,8 @@ const HELP_TEXT: &str = "可用命令:\n\
   /provider 名字     切换 provider(对话历史保留)\n\
   /model 模型名      修改当前 provider 的模型\n\
   /quit              退出\n\
-按键:Enter 发送 · Shift+Enter 换行 · Esc 取消当前轮/回到底部 · \
-PgUp/PgDn 滚动 · ↑/↓ 输入历史 · Ctrl+C×2 退出";
+按键:Enter 发送 · 换行用「行尾 \\ 再回车」(Shift+Enter 仅部分终端支持) · \
+Esc 取消当前轮/回到底部 · PgUp/PgDn 滚动 · ↑/↓ 输入历史 · Ctrl+C×2 退出";
 
 pub fn run(handle: RuntimeHandle) -> anyhow::Result<()> {
     let mut terminal = ratatui::init(); // 含 raw mode、备用屏、panic 钩子
@@ -73,6 +77,9 @@ struct App {
     handle: RuntimeHandle,
     transcript: Transcript,
     input: InputBox,
+
+    /// 已从终端读出、还没处理的事件(Enter 的粘贴检测会预读一批进来)。
+    pending_events: VecDeque<Event>,
 
     // 输入历史(↑/↓ 翻阅)
     history: Vec<String>,
@@ -100,6 +107,7 @@ impl App {
             handle,
             transcript: Transcript::default(),
             input: InputBox::default(),
+            pending_events: VecDeque::new(),
             history: Vec::new(),
             history_idx: None,
             history_draft: String::new(),
@@ -125,20 +133,26 @@ impl App {
                 self.on_agent_event(ev);
                 dirty = true;
             }
-            // 2. 终端输入(33ms 超时 ≈ 30fps 渲染节拍)
-            if event::poll(Duration::from_millis(33))? {
-                match event::read()? {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => {
-                        self.on_key(k.code, k.modifiers);
-                        dirty = true;
-                    }
-                    Event::Paste(s) => {
-                        self.input.insert_str(&s);
-                        dirty = true;
-                    }
-                    Event::Resize(_, _) => dirty = true,
-                    _ => {}
-                }
+            // 2. 终端输入:一帧内把积压处理干净(粘贴洪峰时避免一字符一帧),
+            //    上限防止超大粘贴饿死渲染
+            let mut budget = 512;
+            while budget > 0 {
+                let ev = if let Some(e) = self.pending_events.pop_front() {
+                    e
+                } else if event::poll(Duration::ZERO)? {
+                    event::read()?
+                } else {
+                    break;
+                };
+                self.on_terminal_event(ev);
+                dirty = true;
+                budget -= 1;
+            }
+            // 空闲时阻塞等待(33ms 超时 ≈ 渲染节拍)
+            if !dirty && event::poll(Duration::from_millis(33))? {
+                let ev = event::read()?;
+                self.on_terminal_event(ev);
+                dirty = true;
             }
             // 3. 忙碌时转 spinner
             if self.busy && self.last_spin.elapsed() > Duration::from_millis(100) {
@@ -165,6 +179,15 @@ impl App {
             if self.should_quit {
                 return Ok(());
             }
+        }
+    }
+
+    fn on_terminal_event(&mut self, ev: Event) {
+        match ev {
+            Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k.code, k.modifiers),
+            Event::Paste(s) => self.input.insert_str(&s),
+            Event::Resize(_, _) => {}
+            _ => {}
         }
     }
 
@@ -231,12 +254,17 @@ impl App {
                 self.input.insert_char(c);
             }
             KeyCode::Enter => {
-                let force_newline = mods.contains(KeyModifiers::SHIFT)
-                    || mods.contains(KeyModifiers::ALT)
-                    || mods.contains(KeyModifiers::CONTROL);
-                // 事件队列里还有积压 → 大概率是粘贴洪峰里的换行
-                let paste_burst = event::poll(Duration::ZERO).unwrap_or(false);
-                if force_newline || paste_burst {
+                // ① 修饰键强制换行(传统 conhost 等能上报真实修饰键的终端)
+                if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+                {
+                    self.input.insert_char('\n');
+                }
+                // ② 行尾反斜杠 = 续行:在任何终端都可靠的手动换行方式
+                else if self.input.pop_trailing_backslash() {
+                    self.input.insert_char('\n');
+                }
+                // ③ 粘贴洪峰里的换行(判定逻辑见 enter_means_newline)
+                else if self.enter_means_newline() {
                     self.input.insert_char('\n');
                 } else {
                     self.submit();
@@ -287,6 +315,37 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// 判定这个 Enter 是"粘贴内容里的换行"还是"用户按下发送"。
+    ///
+    /// 背景:conpty 终端(Windows Terminal / VS Code)把一次按键合成为
+    /// **同一瞬间**入队的 Press+Release 两条记录,所以"队列非空"完全
+    /// 不能说明在粘贴——必须把积压事件读出来看内容:
+    /// 粘贴时,这个 Enter 后面必然紧跟着更多**字符按下**事件;
+    /// 手动按 Enter 时,积压里最多只有 Release 之类的噪音。
+    /// 预读的事件存进 `pending_events`,主循环照常消费,一个不丢。
+    ///
+    /// 8ms 小超时是给 conpty 管道分块留的余量(超大粘贴可能在块边界
+    /// 短暂断流);人手两次按键的间隔远大于它,不会把打字误判成粘贴。
+    /// 代价是每次发送多约 8ms 延迟,无感。
+    ///
+    /// 已知取舍:粘贴内容若以换行结尾,最后那个换行会触发发送——
+    /// 与把命令粘进 shell 的行为一致。
+    fn enter_means_newline(&mut self) -> bool {
+        while let Ok(true) = event::poll(Duration::from_millis(8)) {
+            match event::read() {
+                Ok(ev) => self.pending_events.push_back(ev),
+                Err(_) => break,
+            }
+        }
+        self.pending_events.iter().any(|ev| match ev {
+            Event::Key(k) if k.kind == KeyEventKind::Press => {
+                matches!(k.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
+            }
+            Event::Paste(_) => true,
+            _ => false,
+        })
     }
 
     fn on_ctrl_c(&mut self) {
@@ -525,11 +584,15 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    /// 造一个没有真实 Runtime 的句柄(通道对端立即断开,send 会被忽略)。
-    fn dummy_app() -> (App, std::sync::mpsc::Sender<AgentEvent>) {
-        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+    /// 造一个没有真实 Runtime 的 App;返回事件发送端与命令接收端,
+    /// 便于测试注入事件、断言提交行为。
+    fn dummy_app() -> (
+        App,
+        std::sync::mpsc::Sender<AgentEvent>,
+        std::sync::mpsc::Receiver<AgentCommand>,
+    ) {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
-        std::mem::forget(_cmd_rx); // 保持通道存活,send 不报错
         let handle = RuntimeHandle {
             commands: cmd_tx,
             events: evt_rx,
@@ -537,13 +600,13 @@ mod tests {
             provider_label: "mock / test-model".into(),
             provider_names: vec!["mock".into()],
         };
-        (App::new(handle), evt_tx)
+        (App::new(handle), evt_tx, cmd_rx)
     }
 
     /// 完整过一遍事件流 + 输入操作 + 各种尺寸渲染,不允许 panic。
     #[test]
     fn renders_without_panic() {
-        let (mut app, _evt) = dummy_app();
+        let (mut app, _evt, _cmd) = dummy_app();
         // 模拟一轮对话的事件序列
         app.on_agent_event(AgentEvent::UserMessage(
             "读一下 main.rs,中文也要能换行显示".into(),
@@ -604,7 +667,7 @@ mod tests {
     /// 事件驱动的滚动边界:滚过头会被钳制,不会越界 panic。
     #[test]
     fn scroll_is_clamped() {
-        let (mut app, _evt) = dummy_app();
+        let (mut app, _evt, _cmd) = dummy_app();
         for i in 0..50 {
             app.on_agent_event(AgentEvent::Notice(format!("第 {} 条", i)));
         }
@@ -612,5 +675,39 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         assert!(app.scroll_up < 10_000, "渲染后 scroll 应被钳制");
+    }
+
+    /// Enter 必须发送——即使事件队列里躺着 Release 噪音(conpty 终端
+    /// 会把按下/抬起同时入队,这曾导致 Enter 永远被当成换行)。
+    #[test]
+    fn enter_submits() {
+        let (mut app, _evt, cmd) = dummy_app();
+        for c in "你好".chars() {
+            app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        match cmd.try_recv() {
+            Ok(AgentCommand::UserInput(t)) => assert_eq!(t, "你好"),
+            other => panic!("应收到 UserInput,得到 {:?}", other),
+        }
+    }
+
+    /// 行尾反斜杠 + Enter = 续行,不发送;下一次 Enter 正常发送多行内容。
+    #[test]
+    fn backslash_enter_continues_line() {
+        let (mut app, _evt, cmd) = dummy_app();
+        for c in "第一行\\".chars() {
+            app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(cmd.try_recv().is_err(), "续行不应发送");
+        for c in "第二行".chars() {
+            app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        match cmd.try_recv() {
+            Ok(AgentCommand::UserInput(t)) => assert_eq!(t, "第一行\n第二行"),
+            other => panic!("应收到 UserInput,得到 {:?}", other),
+        }
     }
 }
