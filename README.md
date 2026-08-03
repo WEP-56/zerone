@@ -4,6 +4,8 @@
 
 这个仓库其实更适合：在此项目的基础上，扩展其harness工程，制作一个属于自己的可靠的agent。而不是从零构建agent的教程，如果需要的话，请看：[abstract](abstract.md) 内推荐的教程
 
+同时这个仓库的[docs](docs)也是我学习后的总结文档
+
 ```
 TUI / --once ◄──AgentEvent──┐
      └──AgentCommand──► Runtime(Agent Loop)
@@ -48,7 +50,7 @@ src/context/     上下文组装       src/tui/       事件流的一个消费�
 tests/wire.rs    三接口 mock 集成测试(不碰真实网络)
 ```
 
-- 每个源文件头部有设计动机注释;扩展前请读 [docs/](docs):01 架构 → 02 循环 → 03 工具 → 04 提供商 → 05 上下文 → 06 加工具 → 07 加提供商。
+- 每个源文件头部有设计动机注释;扩展前请读 [docs/](docs):01 架构 → 02 循环 → 03 工具 → 04 提供商 → 05 上下文 → 06 加工具 → 07 加提供商 → [08a 底层扩展](docs/08a-more-and-more_basic.md) → [08b 工具扩展](docs/08b-more-and-more_tools.md)。
 - 项目摘要与学习推荐见 [abstract.md](abstract.md)。
 
 ## 刻意的取舍——为了更好扩展性
