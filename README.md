@@ -84,3 +84,9 @@ npm publish zerone-agent-0.1.0.tgz --access public
 版本默认读取 `Cargo.toml`，也可以在手动运行 workflow 时覆盖包名和版本。npm
 包只包含 Node 启动器与预编译二进制，运行时仍是同一个 Rust `zerone` 进程。
 所以发布后续版本只需更新 Cargo.toml 版本
+
+## License
+MIT
+
+## 学ai，上L站
+[linux.do](https://linux.do/)
