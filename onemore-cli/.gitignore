@@ -1,0 +1,10 @@
+# 构建产物
+/target
+/dist
+
+# 可能含 API key,不提交;示例见 config.example.toml
+/config.toml
+
+# 杂项，不提交防止污染仓库
+/.claude
+example/tui
