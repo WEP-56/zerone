@@ -1,23 +1,23 @@
 //! # Context 系统:决定"每次调用模型时,模型看到什么"
 //!
 //! Agent 的一切能力都受限于它每轮看到的上下文。这一层把"组装上下文"
-//! 抽象成可插拔的 [`ContextProvider`] 列表:每轮请求前,Runtime 依次调用
-//! 每个 provider 的 `contribute()`,把系统提示片段与消息注入 [`PromptContext`],
-//! 最后整体交给模型 Provider 发出。
+//! 抽象成两部分:
 //!
-//! 默认装配三个(见 `runtime.rs`):
-//! 1. [`instructions::Instructions`] —— 基础行为准则(可被 config 覆盖);
-//! 2. [`workspace_info::WorkspaceInfo`] —— 运行环境(cwd / OS / shell);
-//! 3. [`conversation::Conversation`] —— 对话历史(唯一贡献 messages 的)。
+//! 1. 可插拔的 [`ContextProvider`] 列表:每轮请求前,Runtime 依次调用
+//!    每个 provider 的 `contribute()`,把系统提示片段注入 [`PromptContext`]。
+//!    默认装配 [`instructions::Instructions`] 与 [`workspace_info::WorkspaceInfo`]。
+//! 2. 消息视图来自 `session::project_model_messages` 的**单向投影**:
+//!    事实日志(SessionEntry)→ 模型消息,再经 [`budget`] 做 token 预算
+//!    (估算 → 折叠旧 ToolResult → 仍超预算就明确拒绝)。
 //!
-//! ## 迁移基线尚未实现的扩展位
-//! 未来的 Planning Context(当前计划/TODO 注入)、Workspace Map
-//! (项目结构地图)、Memory(跨会话记忆)……都只是"再写一个
-//! ContextProvider 并插进列表"而已,Runtime 与模型层无需任何改动。
-//! 压缩(Compression)也应做在这一层:Conversation 在 contribute 时
-//! 把过老的消息折叠成摘要,而不是无脑全量搬运。
+//! 屏幕历史、事实日志与模型上下文自此是三个不同的东西:UI-only 事实
+//! (Notice 等)不进 Provider;压缩改变模型视图但不删除事实。
+//!
+//! ## 扩展位
+//! Planning Context(当前计划/TODO 注入)、Workspace Map(项目结构地图)、
+//! Memory(跨会话记忆)……都只是"再写一个 ContextProvider 并插进列表"。
 
-pub mod conversation;
+pub mod budget;
 pub mod instructions;
 pub mod workspace_info;
 

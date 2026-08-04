@@ -83,6 +83,15 @@ impl ChatMessage {
         }
     }
 
+    /// 创建一个可作为 Provider 终止结果携带的空 assistant 消息。
+    /// 错误本身由 ProviderFailure 携带，避免把诊断文案写入模型历史。
+    pub fn empty_assistant() -> Self {
+        ChatMessage {
+            role: Role::Assistant,
+            blocks: Vec::new(),
+        }
+    }
+
     /// 取出本消息里所有工具调用(Agent Loop 用它决定是否继续循环)。
     pub fn tool_uses(&self) -> Vec<(&str, &str, &serde_json::Value)> {
         self.blocks
@@ -108,7 +117,7 @@ impl ChatMessage {
 
 /// token 用量,跨轮累加后显示在状态栏。
 /// 各 API 的上报位置不同(见 provider 各适配器),这里只管累加。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,

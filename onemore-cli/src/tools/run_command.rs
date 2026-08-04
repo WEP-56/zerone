@@ -26,16 +26,23 @@
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::{optional_u64, require_str, Tool};
-use crate::workspace::Workspace;
+use super::{
+    optional_u64, require_str, Tool, ToolCapabilities, ToolContext, ToolError, ToolErrorCode,
+    ToolOutput, ToolPermissionSpec, ToolSpec,
+};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
+const PIPE_CHUNK_BYTES: usize = 8 * 1024;
+const MAX_DRAIN_CHUNKS_PER_TICK: usize = 256;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const PROGRESS_TAIL_BYTES: usize = 2_000;
 
 /// 实际执行命令的 shell。
 #[derive(Debug, Clone)]
@@ -123,35 +130,31 @@ impl RunCommand {
 }
 
 impl Tool for RunCommand {
-    fn name(&self) -> &'static str {
-        "run_command"
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "run_command".into(),
+            description: format!(
+                "执行一条 shell 命令并返回 stdout/stderr 与退出码。{}。命令必须是非交互式的(stdin 已接 null,任何等待输入的命令会得到 EOF);默认超时 {}s,可用 timeout_secs 调整(上限 {}s);cwd 可指定工作目录(默认为项目根目录,且每次调用互相独立、不保留 cd 状态)。",
+                self.shell.syntax_hint(),
+                DEFAULT_TIMEOUT_SECS,
+                MAX_TIMEOUT_SECS
+            ),
+            schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "command": { "type": "string", "minLength": 1, "description": "要执行的命令" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "超时秒数,默认 120" },
+                    "cwd": { "type": "string", "description": "工作目录,默认项目根目录" }
+                },
+                "required": ["command"]
+            }),
+            capabilities: ToolCapabilities::COMMAND,
+            permission: ToolPermissionSpec::opaque_side_effect(&["cwd"]),
+        }
     }
 
-    fn description(&self) -> String {
-        format!(
-            "执行一条 shell 命令并返回 stdout/stderr 与退出码。{}。\
-             命令必须是非交互式的(stdin 已接 null,任何等待输入的命令会得到 EOF);\
-             默认超时 {}s,可用 timeout_secs 调整(上限 {}s);\
-             cwd 可指定工作目录(默认为项目根目录,且每次调用互相独立、不保留 cd 状态)。",
-            self.shell.syntax_hint(),
-            DEFAULT_TIMEOUT_SECS,
-            MAX_TIMEOUT_SECS
-        )
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": { "type": "string", "description": "要执行的命令" },
-                "timeout_secs": { "type": "integer", "description": "超时秒数,默认 120" },
-                "cwd": { "type": "string", "description": "工作目录,默认项目根目录" }
-            },
-            "required": ["command"]
-        })
-    }
-
-    fn execute(&self, args: &Value, ws: &Workspace, cancel: &AtomicBool) -> Result<String, String> {
+    fn execute(&self, args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let command = require_str(args, "command")?;
         let timeout = Duration::from_secs(
             optional_u64(args, "timeout_secs")?
@@ -160,38 +163,73 @@ impl Tool for RunCommand {
         );
         let cwd = match args.get("cwd").and_then(|v| v.as_str()) {
             Some(p) => {
-                let dir = ws.resolve(p);
+                let dir = ctx.workspace.resolve(p);
                 if !dir.is_dir() {
-                    return Err(format!("cwd {} 不是目录", dir.display()));
+                    return Err(ToolError::new(
+                        ToolErrorCode::NotDirectory,
+                        format!("cwd {} 不是目录", dir.display()),
+                    ));
                 }
                 dir
             }
-            None => ws.root().to_path_buf(),
+            None => ctx.workspace.root().to_path_buf(),
         };
 
-        let (mut cmd, temp_script) = build_invocation(&self.shell, command)?;
+        let (mut cmd, temp_script) =
+            build_invocation(&self.shell, command).map_err(ToolError::execution)?;
         cmd.current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("启动 {} 失败: {}", self.shell.label(), e))?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(path) = temp_script.as_ref() {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(ToolError::execution(format!(
+                    "启动 {} 失败: {}",
+                    self.shell.label(),
+                    error
+                )));
+            }
+        };
 
-        // 两个管道各开一个读线程,避免管道写满导致的死锁
-        let out_handle = spawn_pipe_reader(child.stdout.take());
-        let err_handle = spawn_pipe_reader(child.stderr.take());
+        // 两个管道各开一个读线程,chunk 经 channel 回到执行线程。这样既避免管道死锁,
+        // 又保证 progress callback 永远不会逃出 ToolContext 的同步借用期。
+        let (pipe_tx, pipe_rx) = mpsc::channel();
+        let out_handle = spawn_pipe_reader(child.stdout.take(), Pipe::Stdout, pipe_tx.clone());
+        let err_handle = spawn_pipe_reader(child.stderr.take(), Pipe::Stderr, pipe_tx.clone());
+        drop(pipe_tx);
 
         // 主循环轮询:退出 / 超时 / 用户取消
         let started = Instant::now();
+        let mut last_progress = started;
+        let mut progress_dirty = false;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let ending = loop {
+            progress_dirty |= drain_pipe_chunks(
+                &pipe_rx,
+                &mut stdout,
+                &mut stderr,
+                MAX_DRAIN_CHUNKS_PER_TICK,
+            ) > 0;
+            if progress_dirty && last_progress.elapsed() >= PROGRESS_INTERVAL {
+                report_command_progress(ctx, &stdout, &stderr, started.elapsed());
+                progress_dirty = false;
+                last_progress = Instant::now();
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break Ending::Exited(status.code()),
                 Ok(None) => {}
-                Err(e) => break Ending::WaitFailed(e.to_string()),
+                Err(error) => {
+                    kill_tree(&mut child);
+                    break Ending::WaitFailed(error.to_string());
+                }
             }
-            if cancel.load(Ordering::Relaxed) {
+            if ctx.cancel.load(Ordering::Relaxed) {
                 kill_tree(&mut child);
                 break Ending::Cancelled;
             }
@@ -201,13 +239,25 @@ impl Tool for RunCommand {
             }
             std::thread::sleep(Duration::from_millis(40));
         };
-        // 杀掉后管道关闭,读线程自然结束
-        let stdout = out_handle.join().unwrap_or_default();
-        let stderr = err_handle.join().unwrap_or_default();
-        let _ = child.wait(); // 确保回收
+        // 子进程结束后管道关闭,读线程自然退出。先回收进程,再 join 并排空 channel,
+        // 确保退出前写入的最后一批字节不会丢失。
+        let _ = child.wait();
+        let stdout_read = join_pipe_reader(out_handle, "stdout");
+        let stderr_read = join_pipe_reader(err_handle, "stderr");
+        progress_dirty |= drain_pipe_chunks(&pipe_rx, &mut stdout, &mut stderr, usize::MAX) > 0;
+        if progress_dirty {
+            report_command_progress(ctx, &stdout, &stderr, started.elapsed());
+        }
         if let Some(p) = temp_script {
             let _ = std::fs::remove_file(p);
         }
+
+        if let Err(error) = stdout_read.and(stderr_read) {
+            return Err(ToolError::io(error));
+        }
+
+        let stdout = String::from_utf8_lossy(&stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr).into_owned();
 
         let mut out = String::new();
         if !stdout.trim().is_empty() {
@@ -224,15 +274,45 @@ impl Tool for RunCommand {
         }
 
         match ending {
-            Ending::Exited(Some(0)) => Ok(out),
-            Ending::Exited(code) => Err(format!(
-                "命令退出码 {}\n{}",
-                code.map(|c| c.to_string()).unwrap_or_else(|| "未知".into()),
-                out
-            )),
-            Ending::TimedOut(secs) => Err(format!("命令超时({}s),进程树已终止\n{}", secs, out)),
-            Ending::Cancelled => Err(format!("命令被用户取消,进程树已终止\n{}", out)),
-            Ending::WaitFailed(e) => Err(format!("等待进程失败: {}\n{}", e, out)),
+            Ending::Exited(Some(0)) => Ok(ToolOutput {
+                model_text: out,
+                ui_summary: Some("命令执行成功".into()),
+                details: Some(json!({
+                    "command": command,
+                    "cwd": ctx.workspace.display(&cwd),
+                    "exit_code": 0,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                })),
+            }),
+            Ending::Exited(code) => Err(ToolError {
+                code: ToolErrorCode::ProcessExit,
+                message: format!(
+                    "命令退出码 {}\n{}",
+                    code.map(|value| value.to_string())
+                        .unwrap_or_else(|| "未知".into()),
+                    out
+                ),
+                retryable: false,
+                details: Some(json!({ "exit_code": code, "command": command })),
+            }),
+            Ending::TimedOut(secs) => Err(ToolError {
+                code: ToolErrorCode::Timeout,
+                message: format!("命令超时({}s),进程树已终止\n{}", secs, out),
+                retryable: false,
+                details: Some(json!({ "timeout_secs": secs, "command": command })),
+            }),
+            Ending::Cancelled => Err(ToolError {
+                code: ToolErrorCode::Aborted,
+                message: format!("命令被用户取消,进程树已终止\n{}", out),
+                retryable: false,
+                details: Some(json!({ "command": command })),
+            }),
+            Ending::WaitFailed(error) => Err(ToolError {
+                code: ToolErrorCode::ExecutionFailed,
+                message: format!("等待进程失败: {}\n{}", error, out),
+                retryable: false,
+                details: Some(json!({ "command": command })),
+            }),
         }
     }
 }
@@ -298,14 +378,122 @@ fn temp_script_path(ext: &str) -> PathBuf {
     std::env::temp_dir().join(format!("onemore-cmd-{}-{}.{}", std::process::id(), n, ext))
 }
 
-fn spawn_pipe_reader<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
+#[derive(Clone, Copy)]
+enum Pipe {
+    Stdout,
+    Stderr,
+}
+
+struct PipeChunk {
+    pipe: Pipe,
+    bytes: Vec<u8>,
+}
+
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    stream: Pipe,
+    sender: Sender<PipeChunk>,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = pipe {
-            let _ = p.read_to_end(&mut buf);
+        let Some(mut pipe) = pipe else {
+            return Ok(());
+        };
+        loop {
+            let mut buffer = vec![0; PIPE_CHUNK_BYTES];
+            let read = pipe.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(());
+            }
+            buffer.truncate(read);
+            if sender
+                .send(PipeChunk {
+                    pipe: stream,
+                    bytes: buffer,
+                })
+                .is_err()
+            {
+                return Ok(());
+            }
         }
-        String::from_utf8_lossy(&buf).into_owned()
     })
+}
+
+fn join_pipe_reader(
+    handle: std::thread::JoinHandle<std::io::Result<()>>,
+    stream: &str,
+) -> Result<(), String> {
+    match handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("读取 {} 失败: {}", stream, error)),
+        Err(_) => Err(format!("读取 {} 的线程异常退出", stream)),
+    }
+}
+
+fn drain_pipe_chunks(
+    receiver: &Receiver<PipeChunk>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    limit: usize,
+) -> usize {
+    let mut received = 0;
+    while received < limit {
+        let Ok(chunk) = receiver.try_recv() else {
+            break;
+        };
+        match chunk.pipe {
+            Pipe::Stdout => stdout.extend_from_slice(&chunk.bytes),
+            Pipe::Stderr => stderr.extend_from_slice(&chunk.bytes),
+        }
+        received += 1;
+    }
+    received
+}
+
+fn report_command_progress(
+    ctx: &mut ToolContext<'_>,
+    stdout: &[u8],
+    stderr: &[u8],
+    elapsed: Duration,
+) {
+    let preview = output_tail(stdout, stderr);
+    let last_line = preview
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("等待输出");
+    let summary = format!(
+        "运行 {:.1}s: {}",
+        elapsed.as_secs_f64(),
+        crate::util::ellipsis(last_line, 160)
+    );
+    ctx.report_progress(ToolOutput {
+        model_text: preview,
+        ui_summary: Some(summary),
+        details: Some(json!({
+            "elapsed_ms": elapsed.as_millis(),
+            "stdout_bytes": stdout.len(),
+            "stderr_bytes": stderr.len(),
+        })),
+    });
+}
+
+fn output_tail(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut output = String::new();
+    if !stdout.is_empty() {
+        output.push_str(&lossy_tail(stdout));
+    }
+    if !stderr.is_empty() {
+        if !output.is_empty() {
+            output.push_str("\n--- stderr (tail) ---\n");
+        }
+        output.push_str(&lossy_tail(stderr));
+    }
+    output
+}
+
+fn lossy_tail(bytes: &[u8]) -> String {
+    let start = bytes.len().saturating_sub(PROGRESS_TAIL_BYTES);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
 /// 终止整棵进程树。Windows 用 taskkill /T,其余平台退回单进程 kill。
@@ -323,44 +511,89 @@ fn kill_tree(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::Workspace;
     use std::sync::atomic::AtomicBool;
 
     fn ws() -> Workspace {
         Workspace::new(std::env::temp_dir())
     }
 
+    fn run(tool: &RunCommand, args: Value) -> Result<ToolOutput, ToolError> {
+        let workspace = ws();
+        let cancel = AtomicBool::new(false);
+        tool.execute(
+            &args,
+            &mut ToolContext {
+                workspace: &workspace,
+                cancel: &cancel,
+                session_id: "test",
+                progress: &mut |_| {},
+            },
+        )
+    }
+
     #[test]
     fn echo_roundtrip() {
         let tool = RunCommand::new(detect_shell("auto"));
-        let r = tool.execute(
-            &json!({"command": "echo hello-onemore"}),
-            &ws(),
-            &AtomicBool::new(false),
+        let r = run(&tool, json!({"command": "echo hello-onemore"}));
+        assert!(
+            r.as_ref().unwrap().model_text.contains("hello-onemore"),
+            "{:?}",
+            r
         );
-        assert!(r.as_ref().unwrap().contains("hello-onemore"), "{:?}", r);
     }
 
     #[test]
     fn nonzero_exit_is_error() {
         let tool = RunCommand::new(detect_shell("auto"));
-        let r = tool.execute(
-            &json!({"command": "exit 3"}),
-            &ws(),
-            &AtomicBool::new(false),
-        );
-        assert!(r.unwrap_err().contains("退出码 3"));
+        let r = run(&tool, json!({"command": "exit 3"}));
+        let error = r.unwrap_err();
+        assert_eq!(error.code, ToolErrorCode::ProcessExit);
+        assert!(error.message.contains("退出码 3"));
     }
 
     #[test]
     fn timeout_kills() {
         let tool = RunCommand::new(detect_shell("auto"));
         let t0 = Instant::now();
-        let r = tool.execute(
-            &json!({"command": "sleep 30", "timeout_secs": 2}),
-            &ws(),
-            &AtomicBool::new(false),
-        );
-        assert!(r.unwrap_err().contains("超时"));
+        let r = run(&tool, json!({"command": "sleep 30", "timeout_secs": 2}));
+        let error = r.unwrap_err();
+        assert_eq!(error.code, ToolErrorCode::Timeout);
+        assert!(error.message.contains("超时"));
         assert!(t0.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn output_is_reported_before_command_settles() {
+        let tool = RunCommand::new(detect_shell("auto"));
+        let command = match &tool.shell {
+            Shell::GitBash(_) | Shell::Sh => "echo progress-onemore; sleep 0.4",
+            Shell::PowerShell => "Write-Output progress-onemore; Start-Sleep -Milliseconds 400",
+            Shell::Cmd => "echo progress-onemore & ping 127.0.0.1 -n 2 > nul",
+        };
+        let workspace = ws();
+        let cancel = AtomicBool::new(false);
+        let mut updates = Vec::new();
+        let result = {
+            let mut progress = |update| updates.push(update);
+            tool.execute(
+                &json!({ "command": command }),
+                &mut ToolContext {
+                    workspace: &workspace,
+                    cancel: &cancel,
+                    session_id: "test",
+                    progress: &mut progress,
+                },
+            )
+        };
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            updates
+                .iter()
+                .any(|update| update.model_text.contains("progress-onemore")),
+            "应在命令结束前收到 stdout progress: {updates:?}"
+        );
+        assert!(updates.iter().all(|update| update.details.is_some()));
     }
 }

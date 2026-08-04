@@ -8,6 +8,8 @@ pub enum SlashCommand {
     Model,
     Provider,
     Session,
+    Queue,
+    Compact,
     Clear,
     Help,
     Quit,
@@ -40,6 +42,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "session",
         description: "列出或恢复当前 workspace 的会话",
         accepts_args: true,
+    },
+    CommandSpec {
+        command: SlashCommand::Queue,
+        name: "queue",
+        description: "排队后续任务,当前任务结束后执行",
+        accepts_args: true,
+    },
+    CommandSpec {
+        command: SlashCommand::Compact,
+        name: "compact",
+        description: "压缩历史:摘要替代模型视图,事实日志保留",
+        accepts_args: false,
     },
     CommandSpec {
         command: SlashCommand::Clear,

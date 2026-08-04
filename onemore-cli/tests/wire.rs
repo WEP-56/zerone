@@ -187,15 +187,15 @@ fn assert_common_events(events: &[AgentEvent]) {
             AgentEvent::ToolCallFinished {
                 name,
                 output,
-                is_error,
+                error,
                 ..
             } => {
                 assert_eq!(name, "read_file");
-                assert!(!is_error, "read_file 不应报错: {}", output);
+                assert!(error.is_none(), "read_file 不应报错: {:?}", error);
                 assert!(
-                    output.contains("hello from onemore"),
+                    output.model_text.contains("hello from onemore"),
                     "工具输出应包含文件内容: {}",
-                    output
+                    output.model_text
                 );
                 saw_tool_ok = true;
             }
@@ -405,5 +405,68 @@ fn responses_full_tool_roundtrip() {
     assert_eq!(body["tools"][0]["type"], "function");
     assert_eq!(body["tools"][0]["name"], "read_file");
     assert!(body["tools"][0].get("function").is_none());
+    server.finish();
+}
+
+#[test]
+fn anthropic_eof_before_message_stop_is_an_error() {
+    let response = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}"#, "\n\n",
+        "event: content_block_start\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#, "\n\n",
+        "event: content_block_stop\n",
+        r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+    )
+    .to_string();
+    let server = MockServer::start(vec![response]);
+    let events = run_agent_against("messages", server.port);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Error(message) if message.contains("终止事件"))));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::TurnFinished { cancelled: false })));
+    server.finish();
+}
+
+#[test]
+fn chat_eof_before_done_is_an_error() {
+    let response = r#"data: {"id":"eof","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
+
+"#
+    .to_string();
+    let server = MockServer::start(vec![response]);
+    let events = run_agent_against("chat", server.port);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Error(message) if message.contains("[DONE]"))));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::TurnFinished { cancelled: false })));
+    server.finish();
+}
+
+#[test]
+fn responses_eof_before_terminal_is_an_error() {
+    let response = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"eof"}}"#, "\n\n",
+        "event: response.output_item.added\n",
+        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m"}}"#, "\n\n",
+        "event: response.output_text.delta\n",
+        r#"data: {"type":"response.output_text.delta","output_index":0,"delta":"partial"}"#, "\n\n",
+    )
+    .to_string();
+    let server = MockServer::start(vec![response]);
+    let events = run_agent_against("responses", server.port);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Error(message) if message.contains("terminal"))));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::TurnFinished { cancelled: false })));
     server.finish();
 }

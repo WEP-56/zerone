@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{json, Value};
 
 use super::{
-    args_to_string, http_agent, parse_args, post_sse, sse::SseReader, Provider, ProviderError,
-    ProviderEvent, TurnOutput,
+    args_to_string, http_agent, parse_args, post_sse, sse::SseReader, FailedTurn, Provider,
+    ProviderError, ProviderEvent, StreamTerminal, TurnOutput,
 };
 use crate::config::ProviderSettings;
 use crate::context::PromptContext;
@@ -232,6 +232,22 @@ impl Provider for ResponsesProvider {
         tools: &[ToolSpec],
         on_event: &mut dyn FnMut(ProviderEvent),
         cancel: &AtomicBool,
+    ) -> StreamTerminal {
+        match self.stream_turn_impl(prompt, tools, on_event, cancel) {
+            Ok(Some(output)) => StreamTerminal::Done(output),
+            Ok(None) => StreamTerminal::Aborted(FailedTurn::aborted()),
+            Err(error) => StreamTerminal::Error(FailedTurn::from_error(error)),
+        }
+    }
+}
+
+impl ResponsesProvider {
+    fn stream_turn_impl(
+        &self,
+        prompt: &PromptContext,
+        tools: &[ToolSpec],
+        on_event: &mut dyn FnMut(ProviderEvent),
+        cancel: &AtomicBool,
     ) -> Result<Option<TurnOutput>, ProviderError> {
         let url = super::url_join(&self.settings.base_url, "v1/responses");
         let mut headers: Vec<(&str, String)> = Vec::new();
@@ -246,6 +262,7 @@ impl Provider for ResponsesProvider {
         let mut blocks: Vec<Block> = Vec::new();
         let mut usage = Usage::default();
         let mut stop: Option<StopReason> = None;
+        let mut saw_terminal = false;
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -258,12 +275,11 @@ impl Provider for ResponsesProvider {
                 break;
             };
             if ev.data == "[DONE]" {
+                saw_terminal = true;
                 break;
             }
-            let data: Value = match serde_json::from_str(&ev.data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let data: Value = serde_json::from_str(&ev.data)
+                .map_err(|e| ProviderError::fatal(format!("流事件 JSON 无效: {}", e)))?;
             let index = data["output_index"].as_u64().unwrap_or(0);
 
             match data["type"].as_str().unwrap_or("") {
@@ -317,6 +333,7 @@ impl Provider for ResponsesProvider {
                     }
                 }
                 "response.completed" | "response.incomplete" => {
+                    saw_terminal = true;
                     let resp = &data["response"];
                     if let Some(u) = resp.get("usage").filter(|u| !u.is_null()) {
                         usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
@@ -350,6 +367,10 @@ impl Provider for ResponsesProvider {
                 }
                 _ => {} // created / in_progress / content_part.* 等一律忽略
             }
+        }
+
+        if !saw_terminal {
+            return Err(ProviderError::fatal("流在 response terminal 事件前结束"));
         }
 
         // 流被掐断时的兜底:把半成品按序收编
@@ -405,6 +426,7 @@ mod tests {
             api_key: "test".into(),
             model: "gpt-5".into(),
             max_tokens: None,
+            context_window: None,
         })
     }
 
@@ -441,6 +463,8 @@ mod tests {
             name: "read_file".into(),
             description: "读".into(),
             schema: json!({"type":"object","properties":{}}),
+            capabilities: crate::tools::ToolCapabilities::READ_ONLY,
+            permission: crate::tools::ToolPermissionSpec::default(),
         }];
         let body = provider().build_body(&prompt, &tools);
 

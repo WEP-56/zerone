@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{json, Value};
 
 use super::{
-    args_to_string, http_agent, parse_args, post_sse, sse::SseReader, Provider, ProviderError,
-    ProviderEvent, TurnOutput,
+    args_to_string, http_agent, parse_args, post_sse, sse::SseReader, FailedTurn, Provider,
+    ProviderError, ProviderEvent, StreamTerminal, TurnOutput,
 };
 use crate::config::ProviderSettings;
 use crate::context::PromptContext;
@@ -288,6 +288,22 @@ impl Provider for ChatProvider {
         tools: &[ToolSpec],
         on_event: &mut dyn FnMut(ProviderEvent),
         cancel: &AtomicBool,
+    ) -> StreamTerminal {
+        match self.stream_turn_impl(prompt, tools, on_event, cancel) {
+            Ok(Some(output)) => StreamTerminal::Done(output),
+            Ok(None) => StreamTerminal::Aborted(FailedTurn::aborted()),
+            Err(error) => StreamTerminal::Error(FailedTurn::from_error(error)),
+        }
+    }
+}
+
+impl ChatProvider {
+    fn stream_turn_impl(
+        &self,
+        prompt: &PromptContext,
+        tools: &[ToolSpec],
+        on_event: &mut dyn FnMut(ProviderEvent),
+        cancel: &AtomicBool,
     ) -> Result<Option<TurnOutput>, ProviderError> {
         let url = super::url_join(&self.settings.base_url, "v1/chat/completions");
         let mut headers: Vec<(&str, String)> = Vec::new();
@@ -304,6 +320,7 @@ impl Provider for ChatProvider {
         let mut calls: Vec<PendingCall> = Vec::new();
         let mut finish: Option<String> = None;
         let mut usage = Usage::default();
+        let mut saw_terminal = false;
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -316,12 +333,11 @@ impl Provider for ChatProvider {
                 break;
             };
             if ev.data == "[DONE]" {
+                saw_terminal = true;
                 break;
             }
-            let data: Value = match serde_json::from_str(&ev.data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let data: Value = serde_json::from_str(&ev.data)
+                .map_err(|e| ProviderError::fatal(format!("流事件 JSON 无效: {}", e)))?;
             // 流中途的错误对象(部分兼容服务这样报错)
             if let Some(msg) = data["error"]["message"].as_str() {
                 return Err(ProviderError::fatal(format!("API 错误: {}", msg)));
@@ -364,6 +380,10 @@ impl Provider for ChatProvider {
                     }
                 }
             }
+        }
+
+        if !saw_terminal {
+            return Err(ProviderError::fatal("流在 [DONE] 前结束"));
         }
 
         // 组装统一消息
@@ -416,6 +436,7 @@ mod tests {
             api_key: "test".into(),
             model: "gpt-5".into(),
             max_tokens: None,
+            context_window: None,
         })
     }
 

@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{json, Value};
 
 use super::{
-    args_to_object, http_agent, parse_args, post_sse, sse::SseReader, Provider, ProviderError,
-    ProviderEvent, TurnOutput,
+    args_to_object, http_agent, parse_args, post_sse, sse::SseReader, FailedTurn, Provider,
+    ProviderError, ProviderEvent, StreamTerminal, TurnOutput,
 };
 use crate::config::ProviderSettings;
 use crate::context::PromptContext;
@@ -165,6 +165,22 @@ impl Provider for AnthropicProvider {
         tools: &[ToolSpec],
         on_event: &mut dyn FnMut(ProviderEvent),
         cancel: &AtomicBool,
+    ) -> StreamTerminal {
+        match self.stream_turn_impl(prompt, tools, on_event, cancel) {
+            Ok(Some(output)) => StreamTerminal::Done(output),
+            Ok(None) => StreamTerminal::Aborted(FailedTurn::aborted()),
+            Err(error) => StreamTerminal::Error(FailedTurn::from_error(error)),
+        }
+    }
+}
+
+impl AnthropicProvider {
+    fn stream_turn_impl(
+        &self,
+        prompt: &PromptContext,
+        tools: &[ToolSpec],
+        on_event: &mut dyn FnMut(ProviderEvent),
+        cancel: &AtomicBool,
     ) -> Result<Option<TurnOutput>, ProviderError> {
         let url = super::url_join(&self.settings.base_url, "v1/messages");
         let headers = vec![
@@ -179,6 +195,7 @@ impl Provider for AnthropicProvider {
         let mut blocks: Vec<Block> = Vec::new();
         let mut usage = Usage::default();
         let mut stop = StopReason::EndTurn;
+        let mut saw_terminal = false;
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -188,15 +205,14 @@ impl Provider for AnthropicProvider {
                 .next_event()
                 .map_err(|e| ProviderError::fatal(format!("读取流失败: {}", e)))?
             else {
-                break; // 服务器关流;正常时会先收到 message_stop
+                break;
             };
             if ev.data == "[DONE]" {
+                saw_terminal = true;
                 break;
             }
-            let data: Value = match serde_json::from_str(&ev.data) {
-                Ok(v) => v,
-                Err(_) => continue, // 容忍偶发脏行
-            };
+            let data: Value = serde_json::from_str(&ev.data)
+                .map_err(|e| ProviderError::fatal(format!("流事件 JSON 无效: {}", e)))?;
             // 事件类型以 data.type 为准(event: 行与它一致)
             match data["type"].as_str().unwrap_or("") {
                 "message_start" => {
@@ -287,7 +303,10 @@ impl Provider for AnthropicProvider {
                         usage.output_tokens = n;
                     }
                 }
-                "message_stop" => break,
+                "message_stop" => {
+                    saw_terminal = true;
+                    break;
+                }
                 "error" => {
                     return Err(ProviderError::fatal(format!(
                         "API 流错误: {}",
@@ -296,6 +315,10 @@ impl Provider for AnthropicProvider {
                 }
                 _ => {} // ping 等
             }
+        }
+
+        if !saw_terminal {
+            return Err(ProviderError::fatal("流在终止事件前结束"));
         }
 
         // 防御:极端情况下(流被掐断)可能有没 stop 的半成品,按序收编
@@ -339,6 +362,7 @@ mod tests {
             api_key: "test".into(),
             model: "claude-sonnet-5".into(),
             max_tokens: None,
+            context_window: None,
         })
     }
 
@@ -372,6 +396,8 @@ mod tests {
             name: "read_file".into(),
             description: "读".into(),
             schema: serde_json::json!({"type":"object","properties":{}}),
+            capabilities: crate::tools::ToolCapabilities::READ_ONLY,
+            permission: crate::tools::ToolPermissionSpec::default(),
         }];
         let body = provider().build_body(&prompt, &tools);
 

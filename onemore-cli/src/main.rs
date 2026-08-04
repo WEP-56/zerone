@@ -132,14 +132,16 @@ fn run_once(mut agent: Agent, prompt: String) -> Result<()> {
             AgentEvent::ToolCallStarted { name, summary, .. } => {
                 eprintln!("● {}({})", name, summary);
             }
-            AgentEvent::ToolCallFinished {
-                output, is_error, ..
-            } => {
-                let first = output.lines().next().unwrap_or("");
-                let more = output.lines().count().saturating_sub(1);
+            AgentEvent::ToolCallUpdated { output, .. } => {
+                eprintln!("  … {}", onemore::util::ellipsis(output.ui_text(), 120));
+            }
+            AgentEvent::ToolCallFinished { output, error, .. } => {
+                let shown = output.ui_text();
+                let first = shown.lines().next().unwrap_or("");
+                let more = shown.lines().count().saturating_sub(1);
                 eprintln!(
                     "  └ {}{}{}",
-                    if is_error { "✖ " } else { "" },
+                    if error.is_some() { "✖ " } else { "" },
                     onemore::util::ellipsis(first, 120),
                     if more > 0 {
                         format!(" (+{} 行)", more)
@@ -147,6 +149,15 @@ fn run_once(mut agent: Agent, prompt: String) -> Result<()> {
                         String::new()
                     }
                 );
+            }
+            AgentEvent::PermissionRequested { request } => {
+                eprintln!(
+                    "? {}({}) 需要审批: {}",
+                    request.tool, request.summary, request.reason
+                );
+            }
+            AgentEvent::PermissionResolved { allowed, .. } => {
+                eprintln!("  {}", if allowed { "已允许" } else { "未允许" });
             }
             AgentEvent::Usage {
                 input_tokens,

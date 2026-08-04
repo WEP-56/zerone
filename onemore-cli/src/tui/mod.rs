@@ -37,13 +37,15 @@ use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::{Frame, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
 use crate::event::{AgentCommand, AgentEvent};
 use crate::message::{Block as MessageBlock, ChatMessage, Role};
+use crate::permission::{ApprovalDecision, ApprovalRequest, ApprovalResponse, ApprovalScope};
 use crate::runtime::RuntimeHandle;
+use crate::session::{SessionEntry, SessionEntryPayload};
 use crate::util;
 use input::InputBox;
 use picker::{Picker, PickerItem};
@@ -58,9 +60,12 @@ const HELP_TEXT: &str = "斜杠命令\n\
   /model             选择或输入模型\n\
   /provider          选择 provider(对话历史保留)\n\
   /session [ID]      列出或恢复历史会话\n\
+  /compact           压缩历史(摘要替代模型视图,事实保留)\n\
+  /queue <内容>      排队后续任务(当前任务结束后执行)\n\
   /clear             清空会话\n\
   /quit              退出\n\
 \n\
+运行中输入并回车 = steering:在当前一批工具完成后注入,修正方向;Esc 取消当前轮\n\
 编辑: Ctrl+A/E 行首/行尾 · Ctrl+W 删前一词 · Ctrl+K 删到行尾 · Alt+←/→ 按词移动\n\
 操作: ↑/↓ 浏览候选或历史 · Tab 补全 · Esc 关闭/取消 · 滚轮浏览终端历史 · 鼠标拖动选择文本";
 
@@ -76,6 +81,7 @@ enum Overlay {
     Picker { kind: PickerKind, picker: Picker },
     ModelInput(InputBox),
     Loading { kind: PickerKind, title: String },
+    Approval(ApprovalRequest),
 }
 
 pub fn run(handle: RuntimeHandle) -> anyhow::Result<()> {
@@ -247,7 +253,7 @@ impl App {
                             picker.push_filter(c);
                         }
                     }
-                    Some(Overlay::Loading { .. }) => {}
+                    Some(Overlay::Loading { .. }) | Some(Overlay::Approval(_)) => {}
                     None => {
                         self.input.insert_str(&s);
                         self.on_input_changed();
@@ -275,15 +281,39 @@ impl App {
             AgentEvent::ToolCallPending { name } => {
                 self.status_note = format!("正在生成 {} 的参数", name);
             }
-            AgentEvent::ToolCallStarted { name, summary, .. } => {
+            AgentEvent::ToolCallStarted { id, name, summary } => {
                 self.status_note = format!("执行 {}", name);
-                self.transcript.push_tool(name, summary);
+                self.transcript.push_tool(id, name, summary);
+            }
+            AgentEvent::ToolCallUpdated { output, .. } => {
+                self.status_note = format!("工具进度: {}", output.ui_text());
             }
             AgentEvent::ToolCallFinished {
-                output, is_error, ..
+                id, output, error, ..
             } => {
                 self.status_note = "思考中".into();
-                self.transcript.finish_tool(output, is_error);
+                self.transcript
+                    .finish_tool(&id, output.ui_text().to_string(), error.is_some());
+            }
+            AgentEvent::PermissionRequested { request } => {
+                self.status_note = format!("等待审批: {}", request.tool);
+                self.overlay = Some(Overlay::Approval(request));
+            }
+            AgentEvent::PermissionResolved {
+                request_id,
+                allowed,
+            } => {
+                if matches!(
+                    &self.overlay,
+                    Some(Overlay::Approval(request)) if request.request_id == request_id
+                ) {
+                    self.overlay = None;
+                }
+                self.status_note = if allowed {
+                    "审批通过，正在执行".into()
+                } else {
+                    "审批未通过".into()
+                };
             }
             AgentEvent::Usage {
                 input_tokens,
@@ -345,17 +375,22 @@ impl App {
             }
             AgentEvent::SessionLoaded {
                 id,
-                messages,
+                entries,
                 input_tokens,
                 output_tokens,
             } => {
                 self.session_id = id;
                 self.usage = (input_tokens, output_tokens);
-                self.restore_transcript(&messages);
+                let message_count = entries
+                    .iter()
+                    .filter(|entry| matches!(entry.payload, SessionEntryPayload::Message(_)))
+                    .count();
+                self.restore_transcript(&entries);
                 self.transcript.push_notice(format!(
-                    "已恢复会话 {}({} 条历史消息)",
+                    "已恢复会话 {}({} 条历史消息,{} 条事实)",
                     short_id(&self.session_id),
-                    messages.len()
+                    message_count,
+                    entries.len()
                 ));
                 self.scroll_up = 0;
             }
@@ -370,9 +405,15 @@ impl App {
         }
     }
 
-    fn restore_transcript(&mut self, messages: &[ChatMessage]) {
-        let results: HashMap<&str, (&str, bool)> = messages
+    /// 按事实日志重建画面:Message 还原对话与工具单元,
+    /// Notice/Compaction/ModelChange 等 UI-only 事实以提示行呈现。
+    fn restore_transcript(&mut self, entries: &[SessionEntry]) {
+        let results: HashMap<&str, (&str, bool)> = entries
             .iter()
+            .filter_map(|entry| match &entry.payload {
+                SessionEntryPayload::Message(record) => Some(&record.message),
+                _ => None,
+            })
             .flat_map(|message| message.blocks.iter())
             .filter_map(|block| match block {
                 MessageBlock::ToolResult {
@@ -385,39 +426,65 @@ impl App {
             .collect();
 
         self.transcript.clear();
-        for message in messages {
-            match message.role {
-                Role::User => {
-                    for block in &message.blocks {
-                        if let MessageBlock::Text(text) = block {
-                            self.transcript.push_user(text.clone());
-                        }
+        for entry in entries {
+            match &entry.payload {
+                SessionEntryPayload::Message(record) => {
+                    self.restore_message(&record.message, &results)
+                }
+                SessionEntryPayload::Notice(notice) => {
+                    self.transcript.push_notice(notice.text.clone());
+                }
+                SessionEntryPayload::Compaction(compaction) => {
+                    self.transcript.push_notice(format!(
+                        "—— 历史已压缩(压缩前约 {} tokens);此后模型视图从摘要开始 ——",
+                        compaction.tokens_before
+                    ));
+                }
+                SessionEntryPayload::ModelChange(change) => {
+                    self.transcript
+                        .push_notice(format!("模型切换: {}", change.provider));
+                }
+                SessionEntryPayload::Artifact(_) => {}
+            }
+        }
+    }
+
+    fn restore_message(&mut self, message: &ChatMessage, results: &HashMap<&str, (&str, bool)>) {
+        match message.role {
+            Role::User => {
+                for block in &message.blocks {
+                    if let MessageBlock::Text(text) = block {
+                        self.transcript.push_user(text.clone());
                     }
                 }
-                Role::Assistant => {
-                    for block in &message.blocks {
-                        match block {
-                            MessageBlock::Text(text) => {
-                                self.transcript.append_assistant(text);
-                            }
-                            MessageBlock::Thinking { text, .. } if !text.is_empty() => {
-                                self.transcript.append_thinking(text);
-                            }
-                            MessageBlock::ToolUse { id, name, input } => {
-                                self.transcript
-                                    .push_tool(name.clone(), util::args_summary(input));
-                                if let Some((output, is_error)) = results.get(id.as_str()) {
-                                    self.transcript.finish_tool(
-                                        util::truncate_middle(output, 4000),
-                                        *is_error,
-                                    );
-                                }
-                            }
-                            _ => {}
+            }
+            Role::Assistant => {
+                for block in &message.blocks {
+                    match block {
+                        MessageBlock::Text(text) => {
+                            self.transcript.append_assistant(text);
                         }
+                        MessageBlock::Thinking { text, .. } if !text.is_empty() => {
+                            self.transcript.append_thinking(text);
+                        }
+                        MessageBlock::ToolUse { id, name, input } => {
+                            self.transcript.push_tool(
+                                id.clone(),
+                                name.clone(),
+                                util::args_summary(input),
+                            );
+                            if let Some((output, is_error)) = results.get(id.as_str()) {
+                                self.transcript.finish_tool(
+                                    id,
+                                    util::truncate_middle(output, 4000),
+                                    *is_error,
+                                );
+                            }
+                        }
+                        _ => {}
                     }
-                    self.transcript.close_open_cells();
                 }
+                self.transcript.close_open_cells();
             }
         }
     }
@@ -612,6 +679,7 @@ impl App {
     fn on_overlay_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let mut accept_picker = false;
         let mut close = false;
+        let mut approval = None;
         match self.overlay.as_mut().expect("overlay checked above") {
             Overlay::Picker { picker, .. } => match code {
                 KeyCode::Esc => close = true,
@@ -660,8 +728,39 @@ impl App {
                     close = true;
                 }
             }
+            Overlay::Approval(request) => match code {
+                KeyCode::Enter | KeyCode::Char('y')
+                    if request.scopes.contains(&ApprovalScope::Once) =>
+                {
+                    approval = Some((request.request_id.clone(), ApprovalScope::Once));
+                }
+                KeyCode::Char('a') if request.scopes.contains(&ApprovalScope::Session) => {
+                    approval = Some((request.request_id.clone(), ApprovalScope::Session));
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    let _ = self.handle.approvals.send(ApprovalResponse {
+                        request_id: request.request_id.clone(),
+                        decision: ApprovalDecision::Deny,
+                    });
+                    close = true;
+                }
+                KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
+                    let _ = self.handle.approvals.send(ApprovalResponse {
+                        request_id: request.request_id.clone(),
+                        decision: ApprovalDecision::Deny,
+                    });
+                    close = true;
+                }
+                _ => {}
+            },
         }
-        if accept_picker {
+        if let Some((request_id, scope)) = approval {
+            let _ = self.handle.approvals.send(ApprovalResponse {
+                request_id,
+                decision: ApprovalDecision::Allow(scope),
+            });
+            self.overlay = None;
+        } else if accept_picker {
             self.accept_picker();
         } else if close {
             self.overlay = None;
@@ -773,9 +872,12 @@ impl App {
             return;
         }
         if self.busy {
+            // 运行中回车 = steering:Runtime 会在当前完整工具批之后注入。
+            self.history.push(text.clone());
+            self.history_idx = None;
             self.transcript
-                .push_notice("上一轮仍在进行(Esc 可取消);稍候再发".into());
-            self.input.set(raw);
+                .push_notice("已排队为 steering,将在当前一批工具完成后注入(Esc 取消本轮)".into());
+            let _ = self.handle.commands.send(AgentCommand::Steer(text));
             return;
         }
         self.history.push(text.clone());
@@ -804,6 +906,22 @@ impl App {
             command::SlashCommand::Clear => {
                 // 命令走通道排队,真正清空以 ConversationCleared 事件为准
                 let _ = self.handle.commands.send(AgentCommand::ClearConversation);
+            }
+            command::SlashCommand::Compact => {
+                let _ = self.handle.commands.send(AgentCommand::Compact);
+            }
+            command::SlashCommand::Queue => {
+                if rest.is_empty() {
+                    self.transcript
+                        .push_error("/queue 需要内容,例如 /queue 跑一遍测试".into());
+                } else {
+                    self.transcript
+                        .push_notice("已排队为后续任务,当前任务结束后执行".into());
+                    let _ = self
+                        .handle
+                        .commands
+                        .send(AgentCommand::FollowUp(rest.to_string()));
+                }
             }
             command::SlashCommand::Session => {
                 if rest.is_empty() {
@@ -939,6 +1057,7 @@ impl App {
             let bottom_h = match &self.overlay {
                 Some(Overlay::Picker { picker, .. }) => picker.preferred_height(),
                 Some(Overlay::ModelInput(_)) | Some(Overlay::Loading { .. }) => 5,
+                Some(Overlay::Approval(_)) => 7,
                 None => 0,
             }
             .min(area.height.saturating_sub(2));
@@ -951,6 +1070,7 @@ impl App {
                     draw_model_input(frame, overlay_area, input);
                 }
                 Some(Overlay::Loading { title, .. }) => draw_loading(frame, overlay_area, title),
+                Some(Overlay::Approval(request)) => draw_approval(frame, overlay_area, request),
                 None => {}
             }
             return;
@@ -1191,6 +1311,40 @@ fn draw_loading(frame: &mut Frame, area: Rect, title: &str) {
     );
 }
 
+fn draw_approval(frame: &mut Frame, area: Rect, request: &ApprovalRequest) {
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " 工具审批 ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let text = vec![
+        Line::from(vec![
+            Span::styled("  工具  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&request.tool, Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  参数  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(util::ellipsis(&request.summary, 180)),
+        ]),
+        Line::from(vec![
+            Span::styled("  原因  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(request.reason.clone()),
+        ]),
+        Line::from(Span::styled(
+            "  Enter/Y 本次允许   A 本会话相同调用   N/Esc 拒绝",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
+}
+
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
@@ -1209,11 +1363,14 @@ mod tests {
         App,
         std::sync::mpsc::Sender<AgentEvent>,
         std::sync::mpsc::Receiver<AgentCommand>,
+        std::sync::mpsc::Receiver<ApprovalResponse>,
     ) {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (approval_tx, approval_rx) = std::sync::mpsc::channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
         let handle = RuntimeHandle {
             commands: cmd_tx,
+            approvals: approval_tx,
             events: evt_rx,
             cancel: Arc::new(AtomicBool::new(false)),
             provider_label: "mock / test-model".into(),
@@ -1221,13 +1378,13 @@ mod tests {
             model_names: vec!["test-model".into(), "other-model".into()],
             session_id: "12345678-1234-1234-1234-123456789abc".into(),
         };
-        (App::new(handle), evt_tx, cmd_rx)
+        (App::new(handle), evt_tx, cmd_rx, approval_rx)
     }
 
     /// 完整过一遍事件流 + 输入操作 + 各种尺寸渲染,不允许 panic。
     #[test]
     fn renders_without_panic() {
-        let (mut app, _evt, _cmd) = dummy_app();
+        let (mut app, _evt, _cmd, _approvals) = dummy_app();
         // 模拟一轮对话的事件序列
         app.on_agent_event(AgentEvent::UserMessage(
             "读一下 main.rs,中文也要能换行显示".into(),
@@ -1247,11 +1404,13 @@ mod tests {
         app.on_agent_event(AgentEvent::ToolCallFinished {
             id: "t1".into(),
             name: "read_file".into(),
-            output: (1..=30)
-                .map(|i| format!("{} | line", i))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            is_error: false,
+            output: crate::tools::ToolOutput::text(
+                (1..=30)
+                    .map(|i| format!("{} | line", i))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            error: None,
         });
         app.on_agent_event(AgentEvent::Usage {
             input_tokens: 1234,
@@ -1288,7 +1447,7 @@ mod tests {
     /// 事件驱动的滚动边界:滚过头会被钳制,不会越界 panic。
     #[test]
     fn scroll_is_clamped() {
-        let (mut app, _evt, _cmd) = dummy_app();
+        let (mut app, _evt, _cmd, _approvals) = dummy_app();
         for i in 0..50 {
             app.on_agent_event(AgentEvent::Notice(format!("第 {} 条", i)));
         }
@@ -1302,7 +1461,7 @@ mod tests {
     /// 会把按下/抬起同时入队,这曾导致 Enter 永远被当成换行)。
     #[test]
     fn enter_submits() {
-        let (mut app, _evt, cmd) = dummy_app();
+        let (mut app, _evt, cmd, _approvals) = dummy_app();
         for c in "你好".chars() {
             app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -1315,7 +1474,7 @@ mod tests {
 
     #[test]
     fn session_slash_commands_are_forwarded() {
-        let (mut app, _evt, cmd) = dummy_app();
+        let (mut app, _evt, cmd, _approvals) = dummy_app();
         app.handle_slash("session");
         assert!(matches!(cmd.recv().unwrap(), AgentCommand::ListSessions));
 
@@ -1330,7 +1489,7 @@ mod tests {
     fn session_list_becomes_an_interactive_picker() {
         use crate::storage::SessionSummary;
 
-        let (mut app, _evt, cmd) = dummy_app();
+        let (mut app, _evt, cmd, _approvals) = dummy_app();
         app.handle_slash("session");
         assert!(matches!(cmd.recv().unwrap(), AgentCommand::ListSessions));
         assert!(matches!(
@@ -1377,7 +1536,7 @@ mod tests {
     /// 行尾反斜杠 + Enter = 续行,不发送;下一次 Enter 正常发送多行内容。
     #[test]
     fn backslash_enter_continues_line() {
-        let (mut app, _evt, cmd) = dummy_app();
+        let (mut app, _evt, cmd, _approvals) = dummy_app();
         for c in "第一行\\".chars() {
             app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -1395,7 +1554,7 @@ mod tests {
 
     #[test]
     fn slash_popup_navigates_completes_and_dispatches() {
-        let (mut app, _evt, cmd) = dummy_app();
+        let (mut app, _evt, cmd, _approvals) = dummy_app();
         app.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
         app.on_key(KeyCode::Char('p'), KeyModifiers::NONE);
         assert_eq!(app.selected_slash_command().unwrap().name, "provider");
@@ -1415,7 +1574,7 @@ mod tests {
 
     #[test]
     fn provider_picker_sends_selected_provider() {
-        let (mut app, _evt, cmd) = dummy_app();
+        let (mut app, _evt, cmd, _approvals) = dummy_app();
         app.handle_slash("provider");
         assert!(matches!(
             app.overlay,
@@ -1433,7 +1592,7 @@ mod tests {
 
     #[test]
     fn model_picker_supports_custom_model_input() {
-        let (mut app, _evt, cmd) = dummy_app();
+        let (mut app, _evt, cmd, _approvals) = dummy_app();
         app.handle_slash("model");
         // 从当前 test-model 越过另一个已配置模型，移动到“自定义模型”。
         app.on_key(KeyCode::Down, KeyModifiers::NONE);
@@ -1451,8 +1610,50 @@ mod tests {
     }
 
     #[test]
+    fn approval_overlay_uses_the_dedicated_response_channel() {
+        let (mut app, _evt, _cmd, approvals) = dummy_app();
+        app.on_agent_event(AgentEvent::PermissionRequested {
+            request: ApprovalRequest {
+                request_id: "approval-once".into(),
+                tool: "dynamic_tool".into(),
+                summary: "action=true".into(),
+                reason: "external side effect".into(),
+                scopes: vec![ApprovalScope::Once, ApprovalScope::Session],
+            },
+        });
+        assert!(matches!(app.overlay, Some(Overlay::Approval(_))));
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            approvals.recv().unwrap(),
+            ApprovalResponse {
+                request_id: "approval-once".into(),
+                decision: ApprovalDecision::Allow(ApprovalScope::Once),
+            }
+        );
+        assert!(app.overlay.is_none());
+
+        app.on_agent_event(AgentEvent::PermissionRequested {
+            request: ApprovalRequest {
+                request_id: "approval-deny".into(),
+                tool: "dynamic_tool".into(),
+                summary: String::new(),
+                reason: "ask".into(),
+                scopes: vec![ApprovalScope::Once],
+            },
+        });
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            approvals.recv().unwrap(),
+            ApprovalResponse {
+                request_id: "approval-deny".into(),
+                decision: ApprovalDecision::Deny,
+            }
+        );
+    }
+
+    #[test]
     fn slash_and_picker_views_render_expected_content() {
-        let (mut app, _evt, _cmd) = dummy_app();
+        let (mut app, _evt, _cmd, _approvals) = dummy_app();
         app.input.set("/mo".into());
         let mut term = Terminal::new(TestBackend::new(72, 18)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();

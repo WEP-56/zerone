@@ -56,7 +56,7 @@ pub struct TurnOutput {
 
 /// Provider 层错误。`retryable` 标记网络/限流/服务端故障这类
 /// "重试可能就好了"的错误;Runtime 只在尚未收到任何流事件时才重试。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProviderError {
     pub message: String,
     pub retryable: bool,
@@ -85,17 +85,42 @@ pub trait Provider: Send {
     fn model(&self) -> &str;
     fn set_model(&mut self, model: String);
 
-    /// 发起一次流式调用。
-    /// - 每收到一点增量就回调 `on_event`(驱动 TUI 实时渲染);
-    /// - 每个 SSE 事件之间检查 `cancel`,置位则中止并返回 `Ok(None)`;
-    /// - 返回 `Ok(Some(TurnOutput))` 表示本次调用完整结束。
+    /// Provider 的唯一公共调用边界：每次调用必然终止于 Done、Error 或 Aborted。
     fn stream_turn(
         &self,
         prompt: &PromptContext,
         tools: &[ToolSpec],
         on_event: &mut dyn FnMut(ProviderEvent),
         cancel: &AtomicBool,
-    ) -> Result<Option<TurnOutput>, ProviderError>;
+    ) -> StreamTerminal;
+}
+
+/// 一次 Provider 调用的唯一终止结果。
+#[derive(Debug)]
+pub enum StreamTerminal {
+    Done(TurnOutput),
+    Error(FailedTurn),
+    Aborted(FailedTurn),
+}
+
+/// Provider 失败时仍可供上层消费的最终结果。
+#[derive(Debug)]
+pub struct FailedTurn {
+    pub message: ChatMessage,
+    pub error: ProviderError,
+}
+
+impl FailedTurn {
+    pub fn from_error(error: ProviderError) -> Self {
+        FailedTurn {
+            message: ChatMessage::empty_assistant(),
+            error,
+        }
+    }
+
+    pub fn aborted() -> Self {
+        FailedTurn::from_error(ProviderError::fatal("模型调用已取消"))
+    }
 }
 
 /// 工厂:按配置实例化 Provider。新增一家在这里加一个 match 分支。
@@ -154,10 +179,16 @@ pub(crate) fn post_sse(
     match req.send_string(&body.to_string()) {
         Ok(resp) => Ok(resp.into_reader()),
         Err(ureq::Error::Status(code, resp)) => {
+            // 毫秒头(Anthropic 等)优先于秒级标准头。
             let retry_after = resp
-                .header("retry-after")
+                .header("retry-after-ms")
                 .and_then(|v| v.parse::<u64>().ok())
-                .map(Duration::from_secs);
+                .map(Duration::from_millis)
+                .or_else(|| {
+                    resp.header("retry-after")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map(Duration::from_secs)
+                });
             let text = resp.into_string().unwrap_or_default();
             Err(ProviderError {
                 message: format!("HTTP {}: {}", code, extract_api_error(&text)),

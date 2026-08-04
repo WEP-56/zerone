@@ -11,12 +11,21 @@ max_turns = 50
 # 想完全接管系统提示就取消下面的注释:
 # system_prompt = "You are ..."
 
+# 权限规则:allow | ask | deny。hard deny(设备路径、无法安全解析的路径)不受这里覆盖。
+[permissions]
+workspace_read = "allow"
+workspace_write = "allow"
+outside_workspace = "ask"
+commands = "ask"
+
 # ---- Anthropic Messages API ----
 [providers.anthropic]
 api = "messages"
 base_url = "https://api.anthropic.com"
 model = "claude-sonnet-5"          # 也可: claude-opus-5 / claude-fable-5
 api_key_env = "ANTHROPIC_API_KEY"
+# 配置上下文窗口后启用预算:估算超限时先折叠旧工具结果,仍超限则拒绝发请求并提示 /compact
+context_window = 200000
 # api_key = "sk-ant-..."           # 不想用环境变量就直接写(请保护好此文件)
 
 # ---- OpenAI Responses API(OpenAI 当前主推)----

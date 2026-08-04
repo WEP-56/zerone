@@ -15,6 +15,8 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
+use crate::permission::{PermissionRule, PermissionRules};
+
 /// 三类接口。字符串来自 config 的 `api = "..."`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKind {
@@ -57,6 +59,8 @@ pub struct ProviderSettings {
     pub api_key: String,
     pub model: String,
     pub max_tokens: Option<u64>,
+    /// 模型上下文窗口(token)。配置后启用上下文预算强制。
+    pub context_window: Option<u64>,
 }
 
 // ---- config.toml 的原始形状(serde 直接映射) ----
@@ -65,7 +69,21 @@ pub struct ProviderSettings {
 struct FileConfig {
     agent: AgentSection,
     #[serde(default)]
+    permissions: PermissionsSection,
+    #[serde(default)]
     providers: BTreeMap<String, ProviderSection>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PermissionsSection {
+    #[serde(default)]
+    workspace_read: Option<String>,
+    #[serde(default)]
+    workspace_write: Option<String>,
+    #[serde(default)]
+    outside_workspace: Option<String>,
+    #[serde(default)]
+    commands: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +95,8 @@ struct AgentSection {
     system_prompt: Option<String>,
     #[serde(default)]
     max_turns: Option<u32>,
+    #[serde(default)]
+    tool_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -90,6 +110,8 @@ struct ProviderSection {
     api_key_env: Option<String>,
     #[serde(default)]
     max_tokens: Option<u64>,
+    #[serde(default)]
+    context_window: Option<u64>,
 }
 
 /// 校验过的配置。
@@ -101,6 +123,9 @@ pub struct Config {
     pub system_prompt: Option<String>,
     /// 一轮对话里最多连续调用模型的次数(失控保护)。
     pub max_turns: u32,
+    /// 单个工具调用的执行超时(None = 不限制;run_command 另有自己的超时)。
+    pub tool_timeout: Option<std::time::Duration>,
+    pub permission_rules: PermissionRules,
     providers: BTreeMap<String, ProviderSection>,
 }
 
@@ -120,11 +145,40 @@ impl Config {
                 raw.providers.keys().cloned().collect::<Vec<_>>().join(", ")
             );
         }
+        let defaults = PermissionRules::default();
+        let permission_rules = PermissionRules {
+            workspace_read: parse_permission_rule(
+                raw.permissions.workspace_read.as_deref(),
+                defaults.workspace_read,
+                "workspace_read",
+            )?,
+            workspace_write: parse_permission_rule(
+                raw.permissions.workspace_write.as_deref(),
+                defaults.workspace_write,
+                "workspace_write",
+            )?,
+            outside_workspace: parse_permission_rule(
+                raw.permissions.outside_workspace.as_deref(),
+                defaults.outside_workspace,
+                "outside_workspace",
+            )?,
+            opaque_side_effect: parse_permission_rule(
+                raw.permissions.commands.as_deref(),
+                defaults.opaque_side_effect,
+                "commands",
+            )?,
+        };
         Ok(Config {
             active_provider: raw.agent.provider,
             shell: raw.agent.shell.unwrap_or_else(|| "auto".into()),
             system_prompt: raw.agent.system_prompt,
             max_turns: raw.agent.max_turns.unwrap_or(50).max(1),
+            tool_timeout: raw
+                .agent
+                .tool_timeout_secs
+                .filter(|secs| *secs > 0)
+                .map(std::time::Duration::from_secs),
+            permission_rules,
             providers: raw.providers,
         })
     }
@@ -177,8 +231,21 @@ impl Config {
             api_key,
             model: sec.model.clone(),
             max_tokens: sec.max_tokens,
+            context_window: sec.context_window,
         })
     }
+}
+
+fn parse_permission_rule(
+    value: Option<&str>,
+    default: PermissionRule,
+    field: &str,
+) -> Result<PermissionRule> {
+    value
+        .map(PermissionRule::parse)
+        .transpose()
+        .map_err(|error| anyhow!("[permissions].{}: {}", field, error))
+        .map(|rule| rule.unwrap_or(default))
 }
 
 /// 首次运行时写出的模板(同时也是 config.example.toml 的内容)。
@@ -195,12 +262,21 @@ max_turns = 50
 # 想完全接管系统提示就取消下面的注释:
 # system_prompt = "You are ..."
 
+# 权限规则:allow | ask | deny。hard deny(设备路径、无法安全解析的路径)不受这里覆盖。
+[permissions]
+workspace_read = "allow"
+workspace_write = "allow"
+outside_workspace = "ask"
+commands = "ask"
+
 # ---- Anthropic Messages API ----
 [providers.anthropic]
 api = "messages"
 base_url = "https://api.anthropic.com"
 model = "claude-sonnet-5"          # 也可: claude-opus-5 / claude-fable-5
 api_key_env = "ANTHROPIC_API_KEY"
+# 配置上下文窗口后启用预算:估算超限时先折叠旧工具结果,仍超限则拒绝发请求并提示 /compact
+context_window = 200000
 # api_key = "sk-ant-..."           # 不想用环境变量就直接写(请保护好此文件)
 
 # ---- OpenAI Responses API(OpenAI 当前主推)----
@@ -234,7 +310,8 @@ api_key = ""
 
 #[cfg(test)]
 mod tests {
-    use super::EXAMPLE_CONFIG;
+    use super::{parse_permission_rule, EXAMPLE_CONFIG};
+    use crate::permission::PermissionRule;
 
     #[test]
     fn bundled_example_matches_checked_in_file() {
@@ -242,5 +319,14 @@ mod tests {
             EXAMPLE_CONFIG.trim_end(),
             include_str!("../config.example.toml").trim_end()
         );
+    }
+
+    #[test]
+    fn permission_rules_reject_unknown_values() {
+        assert_eq!(
+            parse_permission_rule(Some("deny"), PermissionRule::Allow, "commands").unwrap(),
+            PermissionRule::Deny
+        );
+        assert!(parse_permission_rule(Some("maybe"), PermissionRule::Allow, "commands").is_err());
     }
 }

@@ -25,6 +25,9 @@ pub enum Cell {
         open: bool,
     },
     Tool {
+        /// ToolUse 的调用 ID。并发批次的完成事件按完成顺序到达,
+        /// 必须按 id 配对,不能假设"最近开放的 Cell 就是这次结束的调用"。
+        id: String,
         name: String,
         summary: String,
         output: Option<String>,
@@ -193,8 +196,9 @@ impl Transcript {
         }
     }
 
-    pub fn push_tool(&mut self, name: String, summary: String) {
+    pub fn push_tool(&mut self, id: String, name: String, summary: String) {
         self.entries.push(Entry::new(Cell::Tool {
+            id,
             name,
             summary,
             output: None,
@@ -203,20 +207,38 @@ impl Transcript {
         self.invalidate_layout();
     }
 
-    /// 把结果填进最近一个"运行中"的工具 Cell。
-    pub fn finish_tool(&mut self, output: String, is_error: bool) {
-        for e in self.entries.iter_mut().rev() {
+    /// 按调用 ID 把结果填进对应的工具 Cell(找不到时退回最近一个运行中的)。
+    pub fn finish_tool(&mut self, id: &str, output: String, is_error: bool) {
+        let mut fallback = None;
+        for (index, e) in self.entries.iter().enumerate().rev() {
             if let Cell::Tool {
-                output: slot @ None,
+                id: cell_id,
+                output: slot,
+                ..
+            } = &e.cell
+            {
+                if slot.is_none() {
+                    if cell_id == id {
+                        fallback = Some(index);
+                        break;
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(index);
+                    }
+                }
+            }
+        }
+        if let Some(index) = fallback {
+            if let Cell::Tool {
+                output: slot,
                 is_error: err_flag,
                 ..
-            } = &mut e.cell
+            } = &mut self.entries[index].cell
             {
                 *slot = Some(output);
                 *err_flag = is_error;
-                e.touch();
+                self.entries[index].touch();
                 self.invalidate_layout();
-                return;
             }
         }
     }
@@ -367,6 +389,7 @@ fn build_lines(cell: &Cell, width: u16) -> Vec<Line<'static>> {
             summary,
             output,
             is_error,
+            ..
         } => {
             let head = if summary.is_empty() {
                 name.clone()

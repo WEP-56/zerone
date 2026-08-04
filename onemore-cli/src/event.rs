@@ -13,14 +13,26 @@
 //! 因为取消必须能打断一个正忙着读流/跑子进程的 Runtime,
 //! 而它忙的时候不会回来看命令通道。
 
-use crate::message::ChatMessage;
+use crate::permission::ApprovalRequest;
+use crate::session::SessionEntry;
 use crate::storage::SessionSummary;
+use crate::tools::{ToolError, ToolOutput};
 
 /// 前端 → Runtime。
 #[derive(Debug, Clone)]
 pub enum AgentCommand {
     /// 用户提交了一段输入,开启新的一轮(turn)。
+    /// 若在活动运行中到达,Runtime 会把它显式归类为 steering 并提示,
+    /// 绝不会隐式并发地开第二个运行。
     UserInput(String),
+    /// 活动运行中的方向修正:在**当前完整工具批提交后**注入,
+    /// 不打断正在执行的工具(紧急停止请用取消)。空闲时等价于 UserInput。
+    Steer(String),
+    /// 排队的后续任务:仅在当前任务将要停止时注入。空闲时等价于 UserInput。
+    FollowUp(String),
+    /// 压缩当前会话:调模型生成摘要,作为 Compaction 事实追加
+    /// (事实日志不减少,模型视图从摘要之后开始)。
+    Compact,
     /// 清空会话历史(/clear)。
     ClearConversation,
     /// 切换到 config.toml 里的另一个 provider profile(/provider)。
@@ -31,7 +43,7 @@ pub enum AgentCommand {
     ListSessions,
     /// 恢复当前 workspace 的一个历史会话(/session <id>)。
     LoadSession(String),
-    /// 退出:Runtime 线程收到后结束自己。
+    /// 退出:Runtime 线程收到后结束自己。活动运行中到达时会请求取消当前轮。
     Shutdown,
 }
 
@@ -54,7 +66,9 @@ pub enum AgentEvent {
 
     /// 模型正在流式生成一次工具调用的参数(还没开始执行)。
     /// 只用于状态栏之类的即时反馈,不该在聊天区落一行。
-    ToolCallPending { name: String },
+    ToolCallPending {
+        name: String,
+    },
 
     /// 模型请求调用工具,即将执行。`summary` 是给人看的一行参数摘要。
     ToolCallStarted {
@@ -62,12 +76,27 @@ pub enum AgentEvent {
         name: String,
         summary: String,
     },
+    /// 工具执行过程中的结构化进度。工具结束后到达的迟到进度应被忽略。
+    ToolCallUpdated {
+        id: String,
+        name: String,
+        output: ToolOutput,
+    },
     /// 工具执行完毕。`output` 已截断/清洗,可直接渲染。
     ToolCallFinished {
         id: String,
         name: String,
-        output: String,
-        is_error: bool,
+        output: ToolOutput,
+        error: Option<ToolError>,
+    },
+
+    /// Runtime 正在独立审批通道上等待；普通命令通道不会承担回复职责。
+    PermissionRequested {
+        request: ApprovalRequest,
+    },
+    PermissionResolved {
+        request_id: String,
+        allowed: bool,
     },
 
     /// 累计 token 用量(每次模型调用结束后推一次,值为会话累计)。
@@ -81,16 +110,18 @@ pub enum AgentEvent {
     /// 会话历史已清空(前端应同步清空画面)。
     ConversationCleared,
     /// provider/模型已变化,`label` 是新的显示名(状态栏用)。
-    ProviderChanged { label: String },
+    ProviderChanged {
+        label: String,
+    },
     /// 当前 workspace 的会话列表。
     SessionsListed {
         current_id: String,
         sessions: Vec<SessionSummary>,
     },
-    /// 历史会话已载入；前端据此重建对话画面。
+    /// 历史会话已载入；前端据此重建对话画面(含 Notice 等 UI-only 事实)。
     SessionLoaded {
         id: String,
-        messages: Vec<ChatMessage>,
+        entries: Vec<SessionEntry>,
         input_tokens: u64,
         output_tokens: u64,
     },
@@ -98,5 +129,7 @@ pub enum AgentEvent {
     Error(String),
 
     /// 一轮结束。`cancelled` = 用户按了 Esc。
-    TurnFinished { cancelled: bool },
+    TurnFinished {
+        cancelled: bool,
+    },
 }

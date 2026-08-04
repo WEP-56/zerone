@@ -14,9 +14,12 @@
 pub mod config;
 pub mod context;
 pub mod event;
+pub mod hooks;
 pub mod message;
+pub mod permission;
 pub mod provider;
 pub mod runtime;
+pub mod session;
 pub mod storage;
 pub mod tools;
 pub mod tui;

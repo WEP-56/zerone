@@ -2,12 +2,21 @@
 //!
 //! Onemore 把机器级数据放在用户主目录的 `.onemore/`：
 //! - `config.toml` 是所有 workspace 共用的配置；
-//! - `sessions/<uuid>.db` 是一会话一库的 SQLite 历史。
+//! - `sessions/<uuid>.db` 是一会话一库的 SQLite 事实日志。
 //!
-//! 数据库只保存厂商无关的 [`ChatMessage`] JSON。这样 provider 报文格式、
-//! TUI 渲染方式发生变化时，存储格式仍然只依赖项目自己的统一消息模型。
-//! 多条有因果约束的消息可以通过 [`SessionStore::append_batch`] 原子提交，
-//! 尤其用于保证 ToolUse 与 ToolResult 不会因进程中断只写入一半。
+//! ## 事实日志(schema v2)
+//! 数据库不再保存"最终模型消息",而是保存 [`SessionEntry`] 事实:
+//! 每条 entry 有 `id + parent_id + kind + payload`,payload 是厂商无关的
+//! [`SessionEntryPayload`] JSON。模型看到什么由 `session::project_model_messages`
+//! 单向投影决定,存储层从不反向修改事实。
+//!
+//! 三条硬性约束:
+//! 1. **append-only**:正常运行只追加 entry;唯一的删除入口是用户显式 /clear。
+//! 2. **entry、leaf、统计在同一事务提交**:崩溃后不会出现"entry 写了一半、
+//!    leaf 指向不存在节点"的状态;带 ToolUse 的消息批在提交前还要过
+//!    [`validate_new_message_batch`],半批直接拒绝。
+//! 3. **旧库迁移原子化**:v1(线性 messages 表)在单个事务里迁移成 v2,
+//!    任何一步失败都回滚,原库保持可用。
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,9 +25,16 @@ use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::message::{Block, ChatMessage, Role, Usage};
+use crate::session::{
+    validate_new_message_batch, MessageRecord, SessionEntry, SessionEntryPayload,
+};
 
 pub const APP_HOME_ENV: &str = "ONEMORE_HOME";
 pub const APP_DIR_NAME: &str = ".onemore";
+
+/// 当前 schema 版本。v1 = 线性 messages 表(无版本号,user_version=0);
+/// v2 = entries 事实日志 + session.leaf_id。
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -75,6 +91,7 @@ fn user_home_dir() -> Result<PathBuf> {
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
+    /// message 类事实条数(不含 Notice/Compaction 等 UI/控制事实)。
     pub message_count: usize,
     pub updated_at: i64,
 }
@@ -102,8 +119,15 @@ impl SessionManager {
         &self.current.id
     }
 
-    pub fn append_batch(&mut self, messages: &[ChatMessage], usage: Usage) -> Result<()> {
-        self.current.append_batch(messages, usage)
+    /// 把一批 payload 变成因果相连的 entry 并原子提交。
+    /// 返回持久化成功的 entry(含分配的 id/parent),调用方以此为准更新内存日志;
+    /// 返回 Err 时数据库与 leaf 均未变化。
+    pub fn append_payloads(
+        &mut self,
+        payloads: Vec<SessionEntryPayload>,
+        usage: Usage,
+    ) -> Result<Vec<SessionEntry>> {
+        self.current.append_payloads(payloads, usage)
     }
 
     pub fn clear(&mut self) -> Result<()> {
@@ -135,10 +159,10 @@ impl SessionManager {
     }
 
     /// 接受完整 UUID 或当前 workspace 内唯一的 UUID 前缀。
-    pub fn load(&mut self, requested_id: &str) -> Result<(Vec<ChatMessage>, Usage)> {
+    pub fn load(&mut self, requested_id: &str) -> Result<(Vec<SessionEntry>, Usage)> {
         let id = self.resolve_id(requested_id)?;
         let next = SessionStore::open(&self.sessions_dir, &id, &self.workspace)?;
-        let loaded = next.load_messages()?;
+        let loaded = next.load_entries()?;
         self.current = next;
         Ok(loaded)
     }
@@ -169,108 +193,185 @@ impl SessionManager {
 struct SessionStore {
     id: String,
     connection: Connection,
+    /// 当前链尾。append 时校验并推进;与数据库在同一事务中保持一致。
+    leaf_id: Option<String>,
 }
 
 impl SessionStore {
     fn create(sessions_dir: &Path, workspace: &str) -> Result<Self> {
         let id = uuid::Uuid::new_v4().to_string();
         let path = sessions_dir.join(format!("{}.db", id));
-        let connection = Connection::open(&path)
+        let mut connection = Connection::open(&path)
             .with_context(|| format!("创建会话数据库 {} 失败", path.display()))?;
-        initialize(&connection)?;
+        initialize(&mut connection)?;
         let now = unix_timestamp();
         connection.execute(
-            "INSERT INTO session (id, workspace, title, created_at, updated_at, input_tokens, output_tokens) \
-             VALUES (?1, ?2, '', ?3, ?3, 0, 0)",
+            "INSERT INTO session (id, workspace, title, created_at, updated_at, input_tokens, output_tokens, leaf_id) \
+             VALUES (?1, ?2, '', ?3, ?3, 0, 0, NULL)",
             params![id, workspace, now],
         )?;
-        Ok(SessionStore { id, connection })
+        Ok(SessionStore {
+            id,
+            connection,
+            leaf_id: None,
+        })
     }
 
     fn open(sessions_dir: &Path, id: &str, workspace: &str) -> Result<Self> {
         let path = sessions_dir.join(format!("{}.db", id));
-        let connection = Connection::open_with_flags(
+        let mut connection = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("打开会话数据库 {} 失败", path.display()))?;
-        initialize(&connection)?;
-        let stored_workspace: Option<String> = connection
-            .query_row("SELECT workspace FROM session WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
+        initialize(&mut connection)?;
+        let row: Option<(String, Option<String>)> = connection
+            .query_row(
+                "SELECT workspace, leaf_id FROM session WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .optional()?;
-        match stored_workspace {
-            Some(stored) if stored == workspace => {}
+        let leaf_id = match row {
+            Some((stored, leaf)) if stored == workspace => leaf,
             Some(_) => bail!("会话 {} 不属于当前 workspace", id),
             None => bail!("会话数据库 {} 缺少元数据", path.display()),
-        }
+        };
         Ok(SessionStore {
             id: id.to_string(),
             connection,
+            leaf_id,
         })
     }
 
-    fn append_batch(&mut self, messages: &[ChatMessage], usage: Usage) -> Result<()> {
-        if messages.is_empty() {
-            return Ok(());
+    fn append_payloads(
+        &mut self,
+        payloads: Vec<SessionEntryPayload>,
+        usage: Usage,
+    ) -> Result<Vec<SessionEntry>> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
         }
+        // 提交边界的最后防线:带 ToolUse 的消息批必须在本批内配对完整。
+        validate_new_message_batch(&payloads).map_err(|reason| anyhow!(reason))?;
+
+        let now = unix_timestamp();
+        let mut parent = self.leaf_id.clone();
+        let mut entries = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let entry = SessionEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                parent_id: parent.clone(),
+                created_at: now,
+                payload,
+            };
+            parent = Some(entry.id.clone());
+            entries.push(entry);
+        }
+
         let tx = self.connection.transaction()?;
+        // leaf 一致性:内存视角与数据库必须指向同一链尾,否则说明有并发写者或损坏。
+        let stored_leaf: Option<String> = tx.query_row(
+            "SELECT leaf_id FROM session WHERE id = ?1",
+            [&self.id],
+            |row| row.get(0),
+        )?;
+        if stored_leaf != self.leaf_id {
+            bail!(
+                "会话链尾不一致(内存 {:?},库内 {:?}),拒绝追加",
+                self.leaf_id,
+                stored_leaf
+            );
+        }
         let mut first_user_text = String::new();
-        for message in messages {
-            let payload = serde_json::to_string(message).context("序列化会话消息失败")?;
-            tx.execute("INSERT INTO messages (payload) VALUES (?1)", [payload])?;
-            if first_user_text.is_empty() && message.role == Role::User {
-                first_user_text = message
-                    .blocks
-                    .iter()
-                    .find_map(|block| match block {
-                        Block::Text(text) if !text.trim().is_empty() => Some(text.trim()),
-                        _ => None,
-                    })
-                    .unwrap_or("")
-                    .chars()
-                    .take(80)
-                    .collect();
+        for entry in &entries {
+            let payload = serde_json::to_string(&entry.payload).context("序列化会话事实失败")?;
+            tx.execute(
+                "INSERT INTO entries (id, parent_id, kind, payload, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    entry.id,
+                    entry.parent_id,
+                    entry.payload.kind(),
+                    payload,
+                    entry.created_at
+                ],
+            )?;
+            if first_user_text.is_empty() {
+                if let SessionEntryPayload::Message(record) = &entry.payload {
+                    if record.message.role == Role::User {
+                        first_user_text = record
+                            .message
+                            .blocks
+                            .iter()
+                            .find_map(|block| match block {
+                                Block::Text(text) if !text.trim().is_empty() => Some(text.trim()),
+                                _ => None,
+                            })
+                            .unwrap_or("")
+                            .chars()
+                            .take(80)
+                            .collect();
+                    }
+                }
             }
         }
+        let leaf = entries.last().map(|entry| entry.id.clone());
         tx.execute(
             "UPDATE session SET \
              title = CASE WHEN title = '' AND ?1 <> '' THEN ?1 ELSE title END, \
-             updated_at = ?2, input_tokens = ?3, output_tokens = ?4 WHERE id = ?5",
+             updated_at = ?2, input_tokens = ?3, output_tokens = ?4, leaf_id = ?5 WHERE id = ?6",
             params![
                 first_user_text,
-                unix_timestamp(),
+                now,
                 usage.input_tokens,
                 usage.output_tokens,
+                leaf,
                 self.id
             ],
         )?;
         tx.commit()?;
-        Ok(())
+        self.leaf_id = leaf;
+        Ok(entries)
     }
 
+    /// 用户显式清空。这是事实日志唯一的删除入口。
     fn clear(&mut self) -> Result<()> {
         let tx = self.connection.transaction()?;
-        tx.execute("DELETE FROM messages", [])?;
+        tx.execute("DELETE FROM entries", [])?;
         tx.execute(
-            "UPDATE session SET title = '', updated_at = ?1, input_tokens = 0, output_tokens = 0 \
-             WHERE id = ?2",
+            "UPDATE session SET title = '', updated_at = ?1, input_tokens = 0, output_tokens = 0, \
+             leaf_id = NULL WHERE id = ?2",
             params![unix_timestamp(), self.id],
         )?;
         tx.commit()?;
+        self.leaf_id = None;
         Ok(())
     }
 
-    fn load_messages(&self) -> Result<(Vec<ChatMessage>, Usage)> {
+    fn load_entries(&self) -> Result<(Vec<SessionEntry>, Usage)> {
         let mut statement = self
             .connection
-            .prepare("SELECT payload FROM messages ORDER BY sequence")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut messages = Vec::new();
+            .prepare("SELECT id, parent_id, payload, created_at FROM entries ORDER BY sequence")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
         for row in rows {
-            let payload = row?;
-            messages.push(serde_json::from_str(&payload).context("会话数据库含有无法解析的消息")?);
+            let (id, parent_id, payload, created_at) = row?;
+            let payload: SessionEntryPayload =
+                serde_json::from_str(&payload).context("会话数据库含有无法解析的事实")?;
+            entries.push(SessionEntry {
+                id,
+                parent_id,
+                created_at,
+                payload,
+            });
         }
         let usage = self.connection.query_row(
             "SELECT input_tokens, output_tokens FROM session WHERE id = ?1",
@@ -282,7 +383,7 @@ impl SessionStore {
                 })
             },
         )?;
-        Ok((messages, usage))
+        Ok((entries, usage))
     }
 
     fn read_summary(path: &Path, workspace: &str) -> Result<Option<SessionSummary>> {
@@ -290,10 +391,19 @@ impl SessionStore {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        // 只读打开不做迁移;v1 库同样能被列出(按旧 messages 表计数)。
+        let version = schema_version(&connection)?;
+        let count_sql = if version >= SCHEMA_VERSION {
+            "SELECT COUNT(*) FROM entries WHERE kind = 'message'"
+        } else {
+            "SELECT COUNT(*) FROM messages"
+        };
         connection
             .query_row(
-                "SELECT id, title, updated_at, (SELECT COUNT(*) FROM messages) \
-                 FROM session WHERE workspace = ?1 LIMIT 1",
+                &format!(
+                    "SELECT id, title, updated_at, ({}) FROM session WHERE workspace = ?1 LIMIT 1",
+                    count_sql
+                ),
                 [workspace],
                 |row| {
                     Ok(SessionSummary {
@@ -309,11 +419,36 @@ impl SessionStore {
     }
 }
 
-fn initialize(connection: &Connection) -> Result<()> {
-    connection.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA foreign_keys = ON;
-         CREATE TABLE IF NOT EXISTS session (
+fn schema_version(connection: &Connection) -> Result<i64> {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn has_table(connection: &Connection, name: &str) -> Result<bool> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// 建表与迁移。全部结构变更在单个事务内完成:
+/// - 全新库直接建 v2;
+/// - v1 库把 messages 逐条包装成 Message 事实迁入 entries,任何解析/写入失败
+///   都会回滚,原库保持 v1 可用(验收:迁移失败保留原库)。
+fn initialize(connection: &mut Connection) -> Result<()> {
+    connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+    let version = schema_version(connection)?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    let legacy = version == 0 && has_table(connection, "messages")?;
+
+    let tx = connection.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session (
              id TEXT PRIMARY KEY,
              workspace TEXT NOT NULL,
              title TEXT NOT NULL,
@@ -322,11 +457,75 @@ fn initialize(connection: &Connection) -> Result<()> {
              input_tokens INTEGER NOT NULL,
              output_tokens INTEGER NOT NULL
          );
-         CREATE TABLE IF NOT EXISTS messages (
+         CREATE TABLE IF NOT EXISTS entries (
              sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-             payload TEXT NOT NULL
+             id TEXT NOT NULL UNIQUE,
+             parent_id TEXT,
+             kind TEXT NOT NULL,
+             payload TEXT NOT NULL,
+             created_at INTEGER NOT NULL
          );",
     )?;
+    if !column_exists(&tx, "session", "leaf_id")? {
+        tx.execute("ALTER TABLE session ADD COLUMN leaf_id TEXT", [])?;
+    }
+    if legacy {
+        migrate_v1_messages(&tx)?;
+        tx.execute("DROP TABLE messages", [])?;
+    }
+    tx.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({})", table))?;
+    let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_v1_messages(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut statement =
+            tx.prepare("SELECT sequence, payload FROM messages ORDER BY sequence")?;
+        let mapped = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        mapped.collect::<rusqlite::Result<_>>()?
+    };
+    let created_at: i64 = tx
+        .query_row("SELECT updated_at FROM session LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|_| unix_timestamp());
+    let mut parent: Option<String> = None;
+    let mut leaf: Option<String> = None;
+    for (sequence, payload) in rows {
+        let message: ChatMessage = serde_json::from_str(&payload)
+            .with_context(|| format!("v1 消息 #{} 无法解析,迁移中止", sequence))?;
+        let entry_payload = SessionEntryPayload::Message(MessageRecord {
+            message,
+            usage: None, // v1 没有逐消息 usage,只有会话累计。
+        });
+        let id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO entries (id, parent_id, kind, payload, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                parent,
+                entry_payload.kind(),
+                serde_json::to_string(&entry_payload)?,
+                created_at
+            ],
+        )?;
+        parent = Some(id.clone());
+        leaf = Some(id);
+    }
+    tx.execute("UPDATE session SET leaf_id = ?1", params![leaf])?;
     Ok(())
 }
 
@@ -350,6 +549,7 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{NoticeLevel, NoticeRecord};
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -360,6 +560,10 @@ mod tests {
         ))
     }
 
+    fn message_payload(message: ChatMessage) -> SessionEntryPayload {
+        SessionEntryPayload::message(message, None)
+    }
+
     #[test]
     fn persists_lists_loads_and_clears_session() {
         let root = temp_root("roundtrip");
@@ -368,35 +572,49 @@ mod tests {
         let sessions = root.join("sessions");
         let mut manager = SessionManager::create(sessions.clone(), &workspace).unwrap();
         let id = manager.current_id().to_string();
-        let messages = vec![
-            ChatMessage::user_text("第一条问题"),
-            ChatMessage {
-                role: Role::Assistant,
-                blocks: vec![Block::Text("回答".into())],
-            },
-        ];
-        manager
-            .append_batch(
-                &messages,
+        let appended = manager
+            .append_payloads(
+                vec![
+                    message_payload(ChatMessage::user_text("第一条问题")),
+                    message_payload(ChatMessage {
+                        role: Role::Assistant,
+                        blocks: vec![Block::Text("回答".into())],
+                    }),
+                    SessionEntryPayload::Notice(NoticeRecord {
+                        text: "仅 UI 可见".into(),
+                        level: NoticeLevel::Info,
+                    }),
+                ],
                 Usage {
                     input_tokens: 12,
                     output_tokens: 7,
                 },
             )
             .unwrap();
+        // parent 链:第一条无 parent,之后逐条相连。
+        assert_eq!(appended[0].parent_id, None);
+        assert_eq!(appended[1].parent_id, Some(appended[0].id.clone()));
+        assert_eq!(appended[2].parent_id, Some(appended[1].id.clone()));
 
         let listed = manager.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title, "第一条问题");
-        assert_eq!(listed[0].message_count, 2);
+        assert_eq!(listed[0].message_count, 2, "Notice 不计入消息数");
 
         let mut other = SessionManager::create(sessions, &workspace).unwrap();
         let (loaded, usage) = other.load(&id[..8]).unwrap();
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].text(), "第一条问题");
+        assert_eq!(loaded.len(), 3);
+        assert!(matches!(loaded[2].payload, SessionEntryPayload::Notice(_)));
         assert_eq!(usage.input_tokens, 12);
         other.clear().unwrap();
         assert!(other.load(&id).unwrap().0.is_empty());
+        // 清空后可以继续追加(leaf 已复位)。
+        other
+            .append_payloads(
+                vec![message_payload(ChatMessage::user_text("再来"))],
+                Usage::default(),
+            )
+            .unwrap();
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -425,50 +643,176 @@ mod tests {
         let sessions = root.join("sessions");
         let mut manager = SessionManager::create(sessions.clone(), &workspace).unwrap();
         let id = manager.current_id().to_string();
-        let messages = vec![
-            ChatMessage::user_text("读取文件"),
-            ChatMessage {
-                role: Role::Assistant,
-                blocks: vec![
-                    Block::Thinking {
-                        text: "先读取".into(),
-                        provider_kind: Some("responses".into()),
-                        raw: Some(serde_json::json!({"id": "reasoning-1"})),
-                    },
-                    Block::ToolUse {
-                        id: "call-1".into(),
-                        name: "read_file".into(),
-                        input: serde_json::json!({"path": "README.md"}),
-                    },
+        manager
+            .append_payloads(
+                vec![
+                    message_payload(ChatMessage::user_text("读取文件")),
+                    message_payload(ChatMessage {
+                        role: Role::Assistant,
+                        blocks: vec![
+                            Block::Thinking {
+                                text: "先读取".into(),
+                                provider_kind: Some("responses".into()),
+                                raw: Some(serde_json::json!({"id": "reasoning-1"})),
+                            },
+                            Block::ToolUse {
+                                id: "call-1".into(),
+                                name: "read_file".into(),
+                                input: serde_json::json!({"path": "README.md"}),
+                            },
+                        ],
+                    }),
+                    message_payload(ChatMessage {
+                        role: Role::User,
+                        blocks: vec![Block::ToolResult {
+                            tool_use_id: "call-1".into(),
+                            content: "file body".into(),
+                            is_error: false,
+                        }],
+                    }),
                 ],
-            },
-            ChatMessage {
-                role: Role::User,
-                blocks: vec![Block::ToolResult {
-                    tool_use_id: "call-1".into(),
-                    content: "file body".into(),
-                    is_error: false,
-                }],
-            },
-        ];
-        manager.append_batch(&messages, Usage::default()).unwrap();
+                Usage::default(),
+            )
+            .unwrap();
 
         let mut reopened = SessionManager::create(sessions, &workspace).unwrap();
         let (loaded, _) = reopened.load(&id).unwrap();
         assert_eq!(loaded.len(), 3);
-        assert_eq!(loaded[1].tool_uses()[0].0, "call-1");
-        match &loaded[2].blocks[0] {
-            Block::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } => {
-                assert_eq!(tool_use_id, "call-1");
-                assert_eq!(content, "file body");
-                assert!(!is_error);
-            }
-            other => panic!("应恢复 ToolResult，得到 {:?}", other),
+        let SessionEntryPayload::Message(assistant) = &loaded[1].payload else {
+            panic!("应为 Message 事实");
+        };
+        assert_eq!(assistant.message.tool_uses()[0].0, "call-1");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn half_tool_batches_are_rejected_at_commit() {
+        let root = temp_root("halfbatch");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut manager = SessionManager::create(root.join("sessions"), &workspace).unwrap();
+        let orphan = message_payload(ChatMessage {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({}),
+            }],
+        });
+        assert!(manager
+            .append_payloads(vec![orphan], Usage::default())
+            .is_err());
+        // 拒绝后日志与 leaf 未变化,正常批仍可提交。
+        let appended = manager
+            .append_payloads(
+                vec![message_payload(ChatMessage::user_text("ok"))],
+                Usage::default(),
+            )
+            .unwrap();
+        assert_eq!(appended[0].parent_id, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 手工构造一个 v1 库(线性 messages 表,user_version=0)。
+    fn create_v1_database(
+        sessions: &Path,
+        workspace: &Path,
+        payloads: &[&str],
+    ) -> (String, PathBuf) {
+        std::fs::create_dir_all(sessions).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = sessions.join(format!("{}.db", id));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                     id TEXT PRIMARY KEY,
+                     workspace TEXT NOT NULL,
+                     title TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     input_tokens INTEGER NOT NULL,
+                     output_tokens INTEGER NOT NULL
+                 );
+                 CREATE TABLE messages (
+                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     payload TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2, '旧标题', 100, 200, 3, 4)",
+                params![id, workspace_key(workspace)],
+            )
+            .unwrap();
+        for payload in payloads {
+            connection
+                .execute("INSERT INTO messages (payload) VALUES (?1)", [payload])
+                .unwrap();
         }
+        (id, path)
+    }
+
+    #[test]
+    fn v1_databases_migrate_to_entries_preserving_order() {
+        let root = temp_root("migrate-ok");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sessions = root.join("sessions");
+        let user = serde_json::to_string(&ChatMessage::user_text("旧问题")).unwrap();
+        let assistant = serde_json::to_string(&ChatMessage {
+            role: Role::Assistant,
+            blocks: vec![Block::Text("旧回答".into())],
+        })
+        .unwrap();
+        let (id, _path) = create_v1_database(&sessions, &workspace, &[&user, &assistant]);
+
+        let mut manager = SessionManager::create(sessions, &workspace).unwrap();
+        let (entries, usage) = manager.load(&id).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].parent_id, None);
+        assert_eq!(entries[1].parent_id, Some(entries[0].id.clone()));
+        let SessionEntryPayload::Message(first) = &entries[0].payload else {
+            panic!("应迁移成 Message 事实");
+        };
+        assert_eq!(first.message.text(), "旧问题");
+        assert_eq!(first.usage, None, "v1 无逐消息 usage");
+        assert_eq!(usage.input_tokens, 3);
+        // 迁移后可以继续追加。
+        manager
+            .append_payloads(
+                vec![message_payload(ChatMessage::user_text("新问题"))],
+                usage,
+            )
+            .unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_and_keeps_v1_database() {
+        let root = temp_root("migrate-fail");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sessions = root.join("sessions");
+        let good = serde_json::to_string(&ChatMessage::user_text("好消息")).unwrap();
+        let (id, path) = create_v1_database(&sessions, &workspace, &[&good, "{not json"]);
+
+        let mut manager = SessionManager::create(sessions, &workspace).unwrap();
+        let error = manager.load(&id).unwrap_err();
+        assert!(
+            format!("{:#}", error).contains("迁移中止"),
+            "错误应说明迁移失败: {:#}",
+            error
+        );
+
+        // 原库应保持 v1:messages 表仍在,user_version 仍为 0,数据完整。
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 0);
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
         let _ = std::fs::remove_dir_all(root);
     }
 }

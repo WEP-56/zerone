@@ -1,11 +1,13 @@
 //! list_dir:列目录。支持 depth 递归,自动跳过体积巨大的常见目录。
 
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 
-use super::{optional_u64, Tool};
+use super::{
+    optional_u64, Tool, ToolCapabilities, ToolContext, ToolError, ToolErrorCode, ToolOutput,
+    ToolPermissionSpec, ToolSpec,
+};
 use crate::workspace::Workspace;
 
 /// 这些目录几乎不会是模型想看的,递归时跳过(仍会显示名字并标注)。
@@ -16,50 +18,62 @@ const MAX_ENTRIES: usize = 500;
 pub struct ListDir;
 
 impl Tool for ListDir {
-    fn name(&self) -> &'static str {
-        "list_dir"
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_dir".into(),
+            description: "列出目录内容(目录在前,附文件大小)。depth 可控制递归层数(默认 1,最大 4);.git/target/node_modules 等目录不会展开。".into(),
+            schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "path": { "type": "string", "description": "目录路径,默认工作目录" },
+                    "depth": { "type": "integer", "minimum": 1, "maximum": 4, "description": "递归层数,默认 1" }
+                },
+                "required": []
+            }),
+            capabilities: ToolCapabilities::READ_ONLY,
+            permission: ToolPermissionSpec::paths(&["path"]),
+        }
     }
 
-    fn description(&self) -> String {
-        "列出目录内容(目录在前,附文件大小)。depth 可控制递归层数(默认 1,最大 4);\
-         .git/target/node_modules 等目录不会展开。"
-            .to_string()
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "目录路径,默认工作目录" },
-                "depth": { "type": "integer", "description": "递归层数,默认 1" }
-            },
-            "required": []
-        })
-    }
-
-    fn execute(
-        &self,
-        args: &Value,
-        ws: &Workspace,
-        _cancel: &AtomicBool,
-    ) -> Result<String, String> {
+    fn execute(&self, args: &Value, ctx: &mut ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let given = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let depth = optional_u64(args, "depth")?.unwrap_or(1).clamp(1, 4);
-        let root = ws.resolve(given);
+        let root = ctx.workspace.resolve(given);
         if !root.is_dir() {
-            return Err(format!("{} 不是目录", root.display()));
+            return Err(ToolError::new(
+                ToolErrorCode::NotDirectory,
+                format!("{} 不是目录", root.display()),
+            ));
         }
 
-        let mut out = format!("{}\n", ws.display(&root));
+        let mut out = format!("{}\n", ctx.workspace.display(&root));
         let mut count = 0usize;
-        walk(ws, &root, depth as usize, 1, &mut out, &mut count)?;
+        walk(
+            ctx.workspace,
+            &root,
+            depth as usize,
+            1,
+            &mut out,
+            &mut count,
+        )?;
+        let truncated = count >= MAX_ENTRIES;
         if count >= MAX_ENTRIES {
             out.push_str(&format!(
                 "……[超过 {} 条,已截断;请指定子目录查看]\n",
                 MAX_ENTRIES
             ));
         }
-        Ok(out)
+        Ok(ToolOutput {
+            model_text: out,
+            ui_summary: Some(format!("已列出 {} 个条目", count)),
+            details: Some(json!({
+                "path": ctx.workspace.display(&root),
+                "entries": count,
+                "depth": depth,
+                "truncated": truncated,
+            })),
+        })
     }
 }
 
@@ -70,8 +84,8 @@ fn walk(
     cur_depth: usize,
     out: &mut String,
     count: &mut usize,
-) -> Result<(), String> {
-    let entries = ws.read_dir_sorted(dir)?;
+) -> Result<(), ToolError> {
+    let entries = ws.read_dir_sorted(dir).map_err(ToolError::io)?;
     let indent = "  ".repeat(cur_depth);
     for e in entries {
         if *count >= MAX_ENTRIES {

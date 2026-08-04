@@ -12,13 +12,20 @@
 //! 当前迁移基线尚未限制 workspace 外路径。这里是后续加入 canonical path、
 //! symlink 与审批策略的统一边界；在策略落地前不能把它视为安全沙箱。
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
+    /// 同一 canonical path 的 mutation 锁表。这是并发之下的第二道资源锁:
+    /// 即使调度层判断两个工具可以并发,同一文件的完整 read-modify-write
+    /// 仍不允许交错(见 [`Workspace::with_file_mutation`])。
+    /// clone 共享同一张表,scoped 线程之间因此互斥。
+    mutation_locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
 /// 单文件读取上限。防止模型 read 一个几百 MB 的日志把内存与上下文炸掉。
@@ -26,7 +33,10 @@ pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 impl Workspace {
     pub fn new(root: PathBuf) -> Self {
-        Workspace { root }
+        Workspace {
+            root,
+            mutation_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -52,6 +62,32 @@ impl Workspace {
         match p.strip_prefix(&self.root) {
             Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
             _ => p.display().to_string(),
+        }
+    }
+
+    /// 在同一文件的 mutation 锁内执行 `f`(完整的 read-modify-write)。
+    /// 锁键优先取真实 canonical path;文件尚不存在时退回词法归一化路径
+    /// (Windows 上统一小写)。锁表随会话生存,不做逐项回收——键的数量
+    /// 与被修改过的文件数同阶,可以接受。
+    pub fn with_file_mutation<T>(&self, path: &Path, f: impl FnOnce() -> T) -> T {
+        let key = self.mutation_key(path);
+        let lock = {
+            let mut table = self
+                .mutation_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(table.entry(key).or_default())
+        };
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        f()
+    }
+
+    fn mutation_key(&self, path: &Path) -> PathBuf {
+        let resolved = fs::canonicalize(path).unwrap_or_else(|_| normalize_lexically(path));
+        if cfg!(windows) {
+            PathBuf::from(resolved.to_string_lossy().to_lowercase())
+        } else {
+            resolved
         }
     }
 
@@ -155,5 +191,46 @@ mod tests {
         let ws = Workspace::new(PathBuf::from(r"E:\proj"));
         assert_eq!(ws.display(Path::new(r"E:\proj\src\a.rs")), r"src\a.rs");
         assert_eq!(ws.display(Path::new(r"D:\other\b.rs")), r"D:\other\b.rs");
+    }
+
+    #[test]
+    fn same_path_mutations_do_not_interleave() {
+        let root = std::env::temp_dir().join(format!(
+            "onemore-ws-mutex-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace::new(root.clone());
+        let path = root.join("shared.txt");
+        ws.write_text(&path, "").unwrap();
+
+        // 两个线程各做一次 read-sleep-write:没有锁时其中一个更新必然丢失。
+        std::thread::scope(|scope| {
+            for marker in ["A", "B"] {
+                let ws = ws.clone(); // clone 共享同一张锁表
+                let path = path.clone();
+                scope.spawn(move || {
+                    ws.with_file_mutation(&path, || {
+                        let current = ws.read_text(&path).unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        ws.write_text(&path, &format!("{}{}", current, marker))
+                            .unwrap();
+                    });
+                });
+            }
+        });
+
+        let content = ws.read_text(&path).unwrap();
+        assert_eq!(
+            content.len(),
+            2,
+            "read-modify-write 交错导致丢失更新: {content:?}"
+        );
+        assert!(content.contains('A') && content.contains('B'));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
