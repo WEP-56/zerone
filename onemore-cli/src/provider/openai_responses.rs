@@ -1,6 +1,6 @@
 //! OpenAI Responses API 适配器(/v1/responses,OpenAI 当前主推的接口)。
 //!
-//! 与 Chat Completions 的核心差异:
+//! 与传统消息接口的核心差异:
 //! - 不是"消息列表"而是"条目(item)列表":消息、函数调用、函数结果、
 //!   推理(reasoning)都是并列的 item 类型;
 //! - 我们以无状态方式使用它(`store: false`,每轮全量带上历史),
@@ -15,7 +15,8 @@
 //! ```text
 //! response.output_item.added                → ToolCallBegun(function_call 时)
 //! response.output_text.delta                → TextDelta
-//! response.reasoning_summary_text.delta     → ThinkingDelta
+//! response.reasoning_summary_text.delta     → ThinkingDelta (OpenAI)
+//! response.reasoning_text.delta             → ThinkingDelta (DeepSeek)
 //! response.function_call_arguments.delta    (拼参数)
 //! response.output_item.done                 (以完整 item 定稿一个 Block)
 //! response.completed / incomplete           (用量、停止原因,收尾)
@@ -33,7 +34,7 @@ use super::{
 };
 use crate::config::ProviderSettings;
 use crate::context::PromptContext;
-use crate::message::{Block, ChatMessage, Role, StopReason, Usage};
+use crate::message::{Block, CacheUsage, ChatMessage, Role, StopReason, Usage};
 use crate::tools::ToolSpec;
 
 /// 标记 Thinking.raw 属于本适配器(切换 provider 后不会误回传)。
@@ -53,6 +54,7 @@ impl ResponsesProvider {
     }
 
     fn build_body(&self, prompt: &PromptContext, tools: &[ToolSpec]) -> Value {
+        let capabilities = self.settings.profile.capabilities();
         let mut input: Vec<Value> = Vec::new();
         for m in &prompt.messages {
             for b in &m.blocks {
@@ -113,7 +115,9 @@ impl ResponsesProvider {
                             raw: Some(item),
                             ..
                         },
-                    ) if provider_kind.as_deref() == Some(KIND) => {
+                    ) if capabilities.encrypted_reasoning_replay
+                        && provider_kind.as_deref() == Some(KIND) =>
+                    {
                         input.push(item.clone());
                     }
                     _ => {}
@@ -125,11 +129,13 @@ impl ResponsesProvider {
             "model": self.settings.model,
             "input": input,
             "stream": true,
-            // 无状态使用:OpenAI 不保存本次响应,历史完全由我们管理
-            "store": false,
-            // 拿到加密的 reasoning 内容,才能在下一轮原样回传
-            "include": ["reasoning.encrypted_content"],
         });
+        if capabilities.encrypted_reasoning_replay {
+            // 无状态使用:OpenAI 不保存本次响应,历史完全由我们管理。
+            body["store"] = json!(false);
+            // 拿到加密的 reasoning 内容,才能在下一轮原样回传。
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
         let system = prompt.system_text();
         if !system.is_empty() {
             body["instructions"] = json!(system);
@@ -137,8 +143,8 @@ impl ResponsesProvider {
         if !tools.is_empty() {
             // 注意:Responses 的工具声明是平铺的,没有 function 包一层
             body["tools"] = Value::Array(
-                tools
-                    .iter()
+                super::sorted_tools(tools)
+                    .into_iter()
                     .map(|t| {
                         json!({
                             "type": "function",
@@ -152,6 +158,14 @@ impl ResponsesProvider {
         }
         if let Some(n) = self.settings.max_tokens {
             body["max_output_tokens"] = json!(n);
+        }
+        if capabilities.prompt_cache_key {
+            body["prompt_cache_key"] = json!(super::prompt_cache_key(
+                self.settings.profile,
+                &self.settings.model,
+                prompt,
+                tools,
+            ));
         }
         body
     }
@@ -170,7 +184,7 @@ enum Partial {
 }
 
 /// 完整 item → 统一 Block。
-fn block_from_item(item: &Value) -> Option<Block> {
+fn block_from_item(item: &Value, encrypted_reasoning_replay: bool) -> Option<Block> {
     match item["type"].as_str().unwrap_or("") {
         "message" => {
             let mut text = String::new();
@@ -203,14 +217,39 @@ fn block_from_item(item: &Value) -> Option<Block> {
                     summary.push_str(p["text"].as_str().unwrap_or(""));
                 }
             }
+            if summary.is_empty() {
+                for key in ["text", "reasoning_text", "content"] {
+                    if let Some(text) = item[key].as_str() {
+                        summary.push_str(text);
+                    }
+                }
+            }
+            let replayable = encrypted_reasoning_replay
+                && item
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some();
             Some(Block::Thinking {
                 text: summary,
-                provider_kind: Some(KIND.to_string()),
-                raw: Some(item.clone()),
+                provider_kind: replayable.then(|| KIND.to_string()),
+                raw: replayable.then(|| item.clone()),
             })
         }
         _ => None,
     }
+}
+
+fn cache_usage(usage: &Value) -> Option<CacheUsage> {
+    let details = &usage["input_tokens_details"];
+    let read = details.get("cached_tokens").and_then(Value::as_u64);
+    let write = details
+        .get("cache_write_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cache_write_tokens").and_then(Value::as_u64));
+    (read.is_some() || write.is_some()).then(|| CacheUsage {
+        read_tokens: read.unwrap_or(0),
+        write_tokens: write.unwrap_or(0),
+    })
 }
 
 impl Provider for ResponsesProvider {
@@ -255,6 +294,8 @@ impl ResponsesProvider {
             headers.push(("authorization", format!("Bearer {}", self.settings.api_key)));
         }
         let body = self.build_body(prompt, tools);
+        let prompt_fingerprint =
+            super::prompt_fingerprint(self.settings.profile, &self.settings.model, prompt, tools);
         let reader = post_sse(&self.agent, &url, &headers, &body)?;
         let mut sse = SseReader::new(reader);
 
@@ -263,6 +304,7 @@ impl ResponsesProvider {
         let mut usage = Usage::default();
         let mut stop: Option<StopReason> = None;
         let mut saw_terminal = false;
+        let capabilities = self.settings.profile.capabilities();
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -314,12 +356,25 @@ impl ResponsesProvider {
                     }
                     on_event(ProviderEvent::TextDelta(piece.to_string()));
                 }
-                "response.reasoning_summary_text.delta" => {
+                "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                     let piece = data["delta"].as_str().unwrap_or("");
                     if let Some(Partial::Reasoning(buf)) = partials.get_mut(&index) {
                         buf.push_str(piece);
                     }
                     on_event(ProviderEvent::ThinkingDelta(piece.to_string()));
+                }
+                "response.reasoning_text.done" => {
+                    // DeepSeek emits a terminal reasoning_text event instead of
+                    // output_item.done. The text may be in either `text` or `delta`.
+                    if let Some(Partial::Reasoning(buf)) = partials.get_mut(&index) {
+                        let piece = data["text"]
+                            .as_str()
+                            .or_else(|| data["delta"].as_str())
+                            .unwrap_or("");
+                        if !piece.is_empty() && !buf.ends_with(piece) {
+                            buf.push_str(piece);
+                        }
+                    }
                 }
                 "response.function_call_arguments.delta" => {
                     if let Some(Partial::Fc { args, .. }) = partials.get_mut(&index) {
@@ -328,7 +383,9 @@ impl ResponsesProvider {
                 }
                 "response.output_item.done" => {
                     partials.remove(&index);
-                    if let Some(b) = block_from_item(&data["item"]) {
+                    if let Some(b) =
+                        block_from_item(&data["item"], capabilities.encrypted_reasoning_replay)
+                    {
                         blocks.push(b);
                     }
                 }
@@ -338,6 +395,7 @@ impl ResponsesProvider {
                     if let Some(u) = resp.get("usage").filter(|u| !u.is_null()) {
                         usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
                         usage.output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
+                        usage.cache = cache_usage(u);
                     }
                     if data["type"] == "response.incomplete" {
                         let reason = resp["incomplete_details"]["reason"]
@@ -409,6 +467,7 @@ impl ResponsesProvider {
             },
             usage,
             stop,
+            prompt_fingerprint: Some(prompt_fingerprint),
         }))
     }
 }
@@ -416,12 +475,13 @@ impl ResponsesProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ApiKind;
+    use crate::config::{ApiKind, ProviderProfile};
 
     fn provider() -> ResponsesProvider {
         ResponsesProvider::new(ProviderSettings {
             name: "openai".into(),
             api: ApiKind::Responses,
+            profile: ProviderProfile::OpenAiResponses,
             base_url: "https://api.openai.com/v1".into(),
             api_key: "test".into(),
             model: "gpt-5".into(),
@@ -470,6 +530,10 @@ mod tests {
 
         assert_eq!(body["instructions"], "sys");
         assert_eq!(body["store"], false);
+        assert!(body["prompt_cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("onemore:v1:openai-responses:"));
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[0]["content"][0]["type"], "input_text");
@@ -497,5 +561,17 @@ mod tests {
         });
         let body = provider().build_body(&prompt, &[]);
         assert!(body["input"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deepseek_omits_openai_private_request_fields() {
+        let mut settings = provider().settings;
+        settings.profile = ProviderProfile::DeepSeekResponses;
+        let provider = ResponsesProvider::new(settings);
+        let body = provider.build_body(&PromptContext::default(), &[]);
+
+        assert!(body.get("store").is_none());
+        assert!(body.get("include").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
     }
 }

@@ -55,6 +55,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $packageDir "bin"), $vendor
 
 Copy-Item -LiteralPath (Join-Path $repoRoot "npm/bin/onemore.js") -Destination (Join-Path $packageDir "bin/onemore.js")
 Copy-Item -LiteralPath (Join-Path $repoRoot "README.md") -Destination (Join-Path $packageDir "README.md")
+Copy-Item -LiteralPath (Join-Path $repoRoot "docs") -Destination (Join-Path $packageDir "docs") -Recurse
 
 $platforms = [ordered]@{
     "win32-x64" = "onemore.exe"
@@ -112,7 +113,7 @@ $packageJson = [ordered]@{
     description = "A reliable and practical coding agent"
     type = "module"
     bin = [ordered]@{ onemore = "bin/onemore.js" }
-    files = @("bin", "vendor", "README.md")
+    files = @("bin", "vendor", "README.md", "docs")
     engines = [ordered]@{ node = ">=18" }
     license = "MIT"
     repository = [ordered]@{

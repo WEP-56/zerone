@@ -30,11 +30,22 @@ use super::{
 };
 use crate::config::ProviderSettings;
 use crate::context::PromptContext;
-use crate::message::{Block, ChatMessage, Role, StopReason, Usage};
+use crate::message::{Block, CacheUsage, ChatMessage, Role, StopReason, Usage};
 use crate::tools::ToolSpec;
 
 const DEFAULT_MAX_TOKENS: u64 = 8192;
 const API_VERSION: &str = "2023-06-01";
+
+fn cache_usage(usage: &Value) -> Option<CacheUsage> {
+    let read = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+    let write = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    (read.is_some() || write.is_some()).then(|| CacheUsage {
+        read_tokens: read.unwrap_or(0),
+        write_tokens: write.unwrap_or(0),
+    })
+}
 
 pub struct AnthropicProvider {
     settings: ProviderSettings,
@@ -119,8 +130,8 @@ impl AnthropicProvider {
         }
         if !tools.is_empty() {
             body["tools"] = Value::Array(
-                tools
-                    .iter()
+                super::sorted_tools(tools)
+                    .into_iter()
                     .map(|t| {
                         json!({
                             "name": t.name,
@@ -183,11 +194,18 @@ impl AnthropicProvider {
         cancel: &AtomicBool,
     ) -> Result<Option<TurnOutput>, ProviderError> {
         let url = super::url_join(&self.settings.base_url, "v1/messages");
-        let headers = vec![
-            ("x-api-key", self.settings.api_key.clone()),
-            ("anthropic-version", API_VERSION.to_string()),
-        ];
+        let mut headers = vec![("x-api-key", self.settings.api_key.clone())];
+        if self
+            .settings
+            .profile
+            .capabilities()
+            .canonical_version_header
+        {
+            headers.push(("anthropic-version", API_VERSION.to_string()));
+        }
         let body = self.build_body(prompt, tools);
+        let prompt_fingerprint =
+            super::prompt_fingerprint(self.settings.profile, &self.settings.model, prompt, tools);
         let reader = post_sse(&self.agent, &url, &headers, &body)?;
         let mut sse = SseReader::new(reader);
 
@@ -219,6 +237,15 @@ impl AnthropicProvider {
                     let u = &data["message"]["usage"];
                     usage.input_tokens = u["input_tokens"].as_u64().unwrap_or(0);
                     usage.output_tokens = u["output_tokens"].as_u64().unwrap_or(0);
+                    usage.cache = cache_usage(u);
+                    // Anthropic reports uncached, cache-read, and cache-write input
+                    // buckets separately. Normalize input_tokens to the full prompt.
+                    if let Some(cache) = usage.cache {
+                        usage.input_tokens = usage
+                            .input_tokens
+                            .saturating_add(cache.read_tokens)
+                            .saturating_add(cache.write_tokens);
+                    }
                 }
                 "content_block_start" => {
                     let index = data["index"].as_u64().unwrap_or(0) as usize;
@@ -345,6 +372,7 @@ impl AnthropicProvider {
             },
             usage,
             stop,
+            prompt_fingerprint: Some(prompt_fingerprint),
         }))
     }
 }
@@ -352,12 +380,13 @@ impl AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ApiKind;
+    use crate::config::{ApiKind, ProviderProfile};
 
     fn provider() -> AnthropicProvider {
         AnthropicProvider::new(ProviderSettings {
             name: "anthropic".into(),
             api: ApiKind::Messages,
+            profile: ProviderProfile::AnthropicMessages,
             base_url: "https://api.anthropic.com".into(),
             api_key: "test".into(),
             model: "claude-sonnet-5".into(),

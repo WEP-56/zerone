@@ -7,7 +7,7 @@ Onemore 的 MVP 骨架是成立的，已有这些正确边界：
 - `runtime.rs:275-308` 会为取消后的未执行 ToolUse 补 ToolResult，并尝试把 assistant + tool result 一起事务提交。
 - `tools/mod.rs:91-122` 将未知工具和工具失败转为模型可见 Observation，而不是让 Runtime 崩溃。
 - `storage.rs:214-245` 使用 SQLite transaction 写入一批消息。
-- `tests/wire.rs` 已覆盖 Messages、Chat Completions、Responses 三条请求/响应链路。
+- `tests/wire.rs` 已覆盖 Messages、Responses 两条请求/响应链路。
 
 但这些保证目前依赖“单 Runtime 线程、线性会话、顺序工具、同步 listener”这一组隐含前提。一旦引入审批、后台任务、并发工具、压缩或多 Agent，现有类型不能继续承载全部语义。
 
@@ -16,7 +16,7 @@ Onemore 的 MVP 骨架是成立的，已有这些正确边界：
 | 优先级 | 缺口 | 源码证据 | 影响 |
 |---|---|---|---|
 | P0 | Provider 没有终止完备协议 | `provider/mod.rs:40-98` 仍是 callback + `Result<Option<TurnOutput>>` | 取消、setup 失败、流中断、正常结束需要多套恢复逻辑 |
-| P0 | EOF 可能被当成成功 | `anthropic.rs:190-193`、`openai_chat.rs:315`、`openai_responses.rs:257` 读到 EOF 后继续组装 `TurnOutput` | 首包后断流可能被误判为正常回答 |
+| P0 | EOF 可能被当成成功 | `anthropic.rs`、`openai_responses.rs` 在无 terminal 事件时拒绝组装 `TurnOutput` | 首包后断流可能被误判为正常回答 |
 | P0 | 目前没有最终失败 assistant message | 失败通常直接 `AgentEvent::Error`，取消是 `Ok(None)` | Provider 错误无法统一进入历史和下一个请求 |
 | P0 | Runtime 没有 ActiveRun、事件归约或 idle settlement | `runtime.rs:196-318` 是单个阻塞 `run_turn` | 无法安全支持重入、steering、follow-up、异步监听者 |
 | P0 | 路径不是安全边界 | `workspace.rs:40-55` 明确允许绝对路径；`workspace.rs:86` 直接 `fs::write` | `..`、symlink/junction、workspace 外写入、命令绕过都未治理 |
@@ -57,10 +57,10 @@ Pi 对应的关键证据是：
 ### 阶段 1：Provider 终止协议与 Runtime 生命周期闭合
 
 - 要解决的问题：统一 `Start/Delta/Done/Error/Aborted`，禁止 EOF 静默成功。
-- 模块：`provider/mod.rs`、三个 adapter、`runtime.rs`、`event.rs`、TUI 兼容映射。
+- 模块：`provider/mod.rs`、两个 adapter、`runtime.rs`、`event.rs`、TUI 兼容映射。
 - 核心类型：`StreamTerminal`、`FailedTurn`、`ProviderEvent::{Started,Delta,Finished,Failed}`；后续加入 `RunId/ActiveRun`。
 - 不变量：每次调用只有一个终止事件；所有终止路径都有 final assistant；`length` 时所有 ToolUse 都不执行；cancel 不提交 partial。
-- 验收：setup 失败、首包前断流、首包后断流、未知 terminal、正常 stop、abort 均有完整终止序列；三种 wire 测试不回归。
+- 验收：setup 失败、首包前断流、首包后断流、未知 terminal、正常 stop、abort 均有完整终止序列；两种 wire 测试不回归。
 - 依赖：阶段 0。
 
 ### 阶段 2：类型化 Tool Pipeline
@@ -146,15 +146,15 @@ Pi 对应的关键证据是：
 推荐从“**Provider 终止协议 + Runtime 运行闭合**”开始，范围保持窄：
 
 1. 先加入 `ScriptedProvider` 和终止路径测试，不改存储模型。
-2. 为 Provider 增加统一终止结果，三种 adapter 都禁止 EOF 静默成功。
+2. 为 Provider 增加统一终止结果，两个 adapter 都禁止 EOF 静默成功。
 3. 让 abort/error 都生成可取得的 final assistant。
 4. Runtime 保留现有 TUI 事件，通过兼容映射逐步增加 started/finished 语义。
 5. 明确 `length` 不执行任何工具调用。
-6. 保持现有 SQLite 线性格式、同步架构和 3 个 wire 测试不变。
+6. 保持现有 SQLite 线性格式、同步架构和 wire 测试不变。
 
 选择理由：它直接修复当前最高风险的错误语义，影响范围集中在 `provider/`、`runtime.rs`、`event.rs` 和测试，不需要先引入异步运行时或重写 Session；后续 ToolOutput、Permission、Recovery、Context Compact 都可以建立在这个终止协议上。
 
-当前本机验证结果也支持这个排序：`cargo test -- --list` 枚举出 55 个单测和 3 个 wire 测试；完整 `cargo test` 实际为 54 通过、`run_command::timeout_kills` 失败，失败点位于 `onemore-cli/src/tools/run_command.rs:364`，应在阶段 0/2 的取消与资源清理测试中优先固定。
+当前本机验证结果：`cargo test --locked` 通过 115 个单测和 5 个 wire 测试，`cargo clippy --locked --all-targets -- -D warnings` 与 release 构建也通过。
 
 **六、值得迁移与不应照搬的 Pi 机制**
 

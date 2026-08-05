@@ -42,7 +42,7 @@ use ratatui::{Frame, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
 use crate::event::{AgentCommand, AgentEvent};
-use crate::message::{Block as MessageBlock, ChatMessage, Role};
+use crate::message::{Block as MessageBlock, ChatMessage, Role, Usage};
 use crate::permission::{ApprovalDecision, ApprovalRequest, ApprovalResponse, ApprovalScope};
 use crate::runtime::RuntimeHandle;
 use crate::session::{SessionEntry, SessionEntryPayload};
@@ -126,7 +126,7 @@ struct App {
     status_note: String,
     provider_label: String,
     session_id: String,
-    usage: (u64, u64),
+    usage: Usage,
     scroll_up: usize,
     last_transcript_height: u16,
 
@@ -156,7 +156,7 @@ impl App {
             status_note: String::new(),
             provider_label,
             session_id,
-            usage: (0, 0),
+            usage: Usage::default(),
             scroll_up: 0,
             last_transcript_height: 20,
             spinner_frame: 0,
@@ -318,7 +318,14 @@ impl App {
             AgentEvent::Usage {
                 input_tokens,
                 output_tokens,
-            } => self.usage = (input_tokens, output_tokens),
+                cache,
+            } => {
+                self.usage = Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache,
+                }
+            }
             AgentEvent::Notice(t) => self.transcript.push_notice(t),
             AgentEvent::Error(t) => {
                 if matches!(self.overlay, Some(Overlay::Loading { .. })) {
@@ -328,7 +335,7 @@ impl App {
             }
             AgentEvent::ConversationCleared => {
                 self.transcript.clear();
-                self.usage = (0, 0);
+                self.usage = Usage::default();
                 self.transcript.push_notice("会话已清空".into());
             }
             AgentEvent::ProviderChanged { label } => {
@@ -378,9 +385,14 @@ impl App {
                 entries,
                 input_tokens,
                 output_tokens,
+                cache,
             } => {
                 self.session_id = id;
-                self.usage = (input_tokens, output_tokens);
+                self.usage = Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache,
+                };
                 let message_count = entries
                     .iter()
                     .filter(|entry| matches!(entry.payload, SessionEntryPayload::Message(_)))
@@ -1212,11 +1224,26 @@ impl App {
         spans.push(Span::styled(
             format!(
                 "  ↑{} ↓{} ",
-                util::fmt_tokens(self.usage.0),
-                util::fmt_tokens(self.usage.1)
+                util::fmt_tokens(self.usage.input_tokens),
+                util::fmt_tokens(self.usage.output_tokens)
             ),
             dim,
         ));
+        if let Some(cache) = self.usage.cache {
+            let ratio = cache
+                .read_tokens
+                .saturating_mul(100)
+                .checked_div(self.usage.input_tokens)
+                .unwrap_or(0);
+            spans.push(Span::styled(
+                format!(
+                    " cache {}%/w{} ",
+                    ratio,
+                    util::fmt_tokens(cache.write_tokens)
+                ),
+                dim,
+            ));
+        }
         let hint = if self.quit_armed_at.is_some() {
             "  再按一次 Ctrl+C 退出".to_string()
         } else if self.scroll_up > 0 {
@@ -1415,6 +1442,7 @@ mod tests {
         app.on_agent_event(AgentEvent::Usage {
             input_tokens: 1234,
             output_tokens: 567,
+            cache: None,
         });
         app.on_agent_event(AgentEvent::AssistantMessage(
             "好的,我来读取。完成了。".into(),

@@ -13,6 +13,7 @@
 //! 因为取消必须能打断一个正忙着读流/跑子进程的 Runtime,
 //! 而它忙的时候不会回来看命令通道。
 
+use crate::message::CacheUsage;
 use crate::permission::ApprovalRequest;
 use crate::session::SessionEntry;
 use crate::storage::SessionSummary;
@@ -103,6 +104,7 @@ pub enum AgentEvent {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        cache: Option<CacheUsage>,
     },
 
     /// 非致命提示(重试中、provider 已切换、历史已清空……)。
@@ -124,6 +126,7 @@ pub enum AgentEvent {
         entries: Vec<SessionEntry>,
         input_tokens: u64,
         output_tokens: u64,
+        cache: Option<CacheUsage>,
     },
     /// 本轮出错终止(HTTP 错误、流解析失败……)。会话仍可继续用。
     Error(String),

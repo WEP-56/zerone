@@ -1,4 +1,4 @@
-//! 三种 API 的"导线级"集成测试:
+//! 两种 API 的"导线级"集成测试:
 //! 本地起一个脚本化的 mock SSE 服务器,让 Agent 完整跑一轮
 //!   用户输入 → 模型(mock)请求 read_file → 真实执行工具 → 结果回填 → 最终回答
 //! 并校验:
@@ -122,6 +122,10 @@ fn read_http_request(reader: &mut BufReader<impl Read>) -> Option<String> {
 
 /// 准备一个临时工作目录(内含 hello.txt)+ 指向 mock 的配置,跑一轮对话。
 fn run_agent_against(api: &str, port: u16) -> Vec<AgentEvent> {
+    run_agent_against_profile(api, None, port)
+}
+
+fn run_agent_against_profile(api: &str, profile: Option<&str>, port: u16) -> Vec<AgentEvent> {
     // 用户环境里的代理会劫持 127.0.0.1 请求,测试内清掉
     for k in [
         "HTTPS_PROXY",
@@ -147,11 +151,16 @@ provider = "mock"
 
 [providers.mock]
 api = "{}"
+{}
 base_url = "http://127.0.0.1:{}"
 model = "test-model"
 api_key = "test-key"
 "#,
-            api, port
+            api,
+            profile
+                .map(|value| format!("profile = {:?}", value))
+                .unwrap_or_default(),
+            port
         ),
     )
     .unwrap();
@@ -175,6 +184,13 @@ api_key = "test-key"
         );
     }
     events
+}
+
+fn last_cache_usage(events: &[AgentEvent]) -> Option<onemore::message::CacheUsage> {
+    events.iter().rev().find_map(|event| match event {
+        AgentEvent::Usage { cache, .. } => *cache,
+        _ => None,
+    })
 }
 
 /// 事件流的共同断言:助手说了话、read_file 真的执行了且拿到文件内容、正常收尾。
@@ -225,7 +241,7 @@ fn assert_common_events(events: &[AgentEvent]) {
 fn anthropic_full_tool_roundtrip() {
     let turn1 = concat!(
         "event: message_start\n",
-        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}"#, "\n\n",
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":6,"cache_creation_input_tokens":4}}}"#, "\n\n",
         "event: content_block_start\n",
         r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
         "event: content_block_delta\n",
@@ -245,7 +261,7 @@ fn anthropic_full_tool_roundtrip() {
     ).to_string();
     let turn2 = concat!(
         "event: message_start\n",
-        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":60,"output_tokens":1}}}"#, "\n\n",
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":60,"output_tokens":1,"cache_read_input_tokens":30,"cache_creation_input_tokens":0}}}"#, "\n\n",
         "event: content_block_start\n",
         r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
         "event: content_block_delta\n",
@@ -261,6 +277,9 @@ fn anthropic_full_tool_roundtrip() {
     let server = MockServer::start(vec![turn1, turn2]);
     let events = run_agent_against("messages", server.port);
     assert_common_events(&events);
+    let cache = last_cache_usage(&events).expect("Anthropic 应上报缓存用量");
+    assert_eq!(cache.read_tokens, 36);
+    assert_eq!(cache.write_tokens, 4);
 
     // 第二次请求体:历史编码是否符合 Messages API
     let body = server.body(1);
@@ -289,58 +308,6 @@ fn anthropic_full_tool_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI Chat Completions
-// ---------------------------------------------------------------------------
-
-#[test]
-fn chat_completions_full_tool_roundtrip() {
-    let turn1 = concat!(
-        r#"data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":"看看文件。"},"finish_reason":null}]}"#, "\n\n",
-        r#"data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}]}"#, "\n\n",
-        r#"data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"hello.txt\"}"}}]},"finish_reason":null}]}"#, "\n\n",
-        r#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#, "\n\n",
-        r#"data: {"id":"c1","choices":[],"usage":{"prompt_tokens":15,"completion_tokens":25}}"#, "\n\n",
-        "data: [DONE]\n\n",
-    ).to_string();
-    let turn2 = concat!(
-        r#"data: {"id":"c2","choices":[{"index":0,"delta":{"role":"assistant","content":"读取"},"finish_reason":null}]}"#, "\n\n",
-        r#"data: {"id":"c2","choices":[{"index":0,"delta":{"content":"完成。"},"finish_reason":null}]}"#, "\n\n",
-        r#"data: {"id":"c2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#, "\n\n",
-        r#"data: {"id":"c2","choices":[],"usage":{"prompt_tokens":70,"completion_tokens":6}}"#, "\n\n",
-        "data: [DONE]\n\n",
-    ).to_string();
-
-    let server = MockServer::start(vec![turn1, turn2]);
-    let events = run_agent_against("chat", server.port);
-    assert_common_events(&events);
-
-    let body = server.body(1);
-    let msgs = body["messages"].as_array().unwrap();
-    // [0] system, [1] user, [2] assistant(tool_calls), [3] tool, [4] 无
-    assert_eq!(msgs[0]["role"], "system");
-    assert_eq!(msgs[2]["role"], "assistant");
-    let tc = &msgs[2]["tool_calls"][0];
-    assert_eq!(tc["id"], "call_abc");
-    assert_eq!(tc["type"], "function");
-    assert_eq!(tc["function"]["name"], "read_file");
-    // arguments 必须是 JSON 字符串(不是对象)
-    let args: serde_json::Value =
-        serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
-    assert_eq!(args["path"], "hello.txt");
-    assert_eq!(msgs[3]["role"], "tool");
-    assert_eq!(msgs[3]["tool_call_id"], "call_abc");
-    assert!(msgs[3]["content"]
-        .as_str()
-        .unwrap()
-        .contains("hello from onemore"));
-    // 工具声明包一层 function;显式请求用量
-    assert_eq!(body["tools"][0]["type"], "function");
-    assert!(body["tools"][0]["function"]["parameters"]["type"] == "object");
-    assert_eq!(body["stream_options"]["include_usage"], true);
-    server.finish();
-}
-
-// ---------------------------------------------------------------------------
 // OpenAI Responses
 // ---------------------------------------------------------------------------
 
@@ -362,7 +329,7 @@ fn responses_full_tool_roundtrip() {
         "event: response.output_item.done\n",
         r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_r1","name":"read_file","arguments":"{\"path\":\"hello.txt\"}","status":"completed"}}"#, "\n\n",
         "event: response.completed\n",
-        r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":20,"output_tokens":18}}}"#, "\n\n",
+        r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":20,"output_tokens":18,"input_tokens_details":{"cached_tokens":8,"cache_write_tokens":2}}}}"#, "\n\n",
     ).to_string();
     let turn2 = concat!(
         "event: response.created\n",
@@ -376,14 +343,23 @@ fn responses_full_tool_roundtrip() {
         "event: response.output_item.done\n",
         r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"读取完成。"}]}}"#, "\n\n",
         "event: response.completed\n",
-        r#"data: {"type":"response.completed","response":{"id":"resp_2","status":"completed","usage":{"input_tokens":90,"output_tokens":7}}}"#, "\n\n",
+        r#"data: {"type":"response.completed","response":{"id":"resp_2","status":"completed","usage":{"input_tokens":90,"output_tokens":7,"input_tokens_details":{"cached_tokens":60,"cache_write_tokens":0}}}}"#, "\n\n",
     ).to_string();
 
     let server = MockServer::start(vec![turn1, turn2]);
     let events = run_agent_against("responses", server.port);
     assert_common_events(&events);
+    let cache = last_cache_usage(&events).expect("OpenAI 应上报缓存用量");
+    assert_eq!(cache.read_tokens, 68);
+    assert_eq!(cache.write_tokens, 2);
 
+    let first_body = server.body(0);
     let body = server.body(1);
+    assert_eq!(first_body["prompt_cache_key"], body["prompt_cache_key"]);
+    assert!(body["prompt_cache_key"]
+        .as_str()
+        .unwrap()
+        .starts_with("onemore:v1:openai-responses:"));
     assert_eq!(body["store"], false);
     assert!(body["instructions"].as_str().unwrap().contains("Onemore"));
     let input = body["input"].as_array().unwrap();
@@ -402,9 +378,65 @@ fn responses_full_tool_roundtrip() {
         .contains("hello from onemore"));
     // reasoning 必须排在它的 function_call 之前(API 硬性要求)
     // 工具声明是平铺的
-    assert_eq!(body["tools"][0]["type"], "function");
-    assert_eq!(body["tools"][0]["name"], "read_file");
-    assert!(body["tools"][0].get("function").is_none());
+    let read_file = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "read_file")
+        .unwrap();
+    assert_eq!(read_file["type"], "function");
+    assert!(read_file.get("function").is_none());
+    server.finish();
+}
+
+#[test]
+fn deepseek_reasoning_text_is_streamed_without_encrypted_replay() {
+    let turn1 = concat!(
+        "event: response.created\n",
+        r#"data: {"type":"response.created","response":{"id":"ds_resp_1"}}"#, "\n\n",
+        "event: response.output_item.added\n",
+        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_ds"}}"#, "\n\n",
+        "event: response.reasoning_text.delta\n",
+        r#"data: {"type":"response.reasoning_text.delta","output_index":0,"delta":"先看文件。"}"#, "\n\n",
+        "event: response.reasoning_text.done\n",
+        r#"data: {"type":"response.reasoning_text.done","output_index":0,"text":"先看文件。"}"#, "\n\n",
+        "event: response.output_item.done\n",
+        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_ds","text":"先看文件。"}}"#, "\n\n",
+        "event: response.output_item.added\n",
+        r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_ds","call_id":"call_ds","name":"read_file","arguments":""}}"#, "\n\n",
+        "event: response.function_call_arguments.delta\n",
+        r#"data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"path\":\"hello.txt\"}"}"#, "\n\n",
+        "event: response.output_item.done\n",
+        r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_ds","call_id":"call_ds","name":"read_file","arguments":"{\"path\":\"hello.txt\"}"}}"#, "\n\n",
+        "event: response.completed\n",
+        r#"data: {"type":"response.completed","response":{"id":"ds_resp_1","usage":{"input_tokens":10,"output_tokens":12,"input_tokens_details":{"cached_tokens":6}}}}"#, "\n\n",
+    ).to_string();
+    let turn2 = concat!(
+        "event: response.output_item.added\n",
+        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"ds_msg_2","role":"assistant","content":[]}}"#, "\n\n",
+        "event: response.output_text.delta\n",
+        r#"data: {"type":"response.output_text.delta","output_index":0,"delta":"读取完成。"}"#, "\n\n",
+        "event: response.completed\n",
+        r#"data: {"type":"response.completed","response":{"id":"ds_resp_2","usage":{"input_tokens":20,"output_tokens":4,"input_tokens_details":{"cached_tokens":15}}}}"#, "\n\n",
+    ).to_string();
+
+    let server = MockServer::start(vec![turn1, turn2]);
+    let events = run_agent_against_profile("responses", Some("deepseek-responses"), server.port);
+    assert_common_events(&events);
+    let cache = last_cache_usage(&events).expect("DeepSeek 应上报缓存读取量");
+    assert_eq!(cache.read_tokens, 21);
+    assert_eq!(cache.write_tokens, 0);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ThinkingDelta(text) if text.contains("先看文件")
+    )));
+
+    let body = server.body(1);
+    assert!(body.get("store").is_none());
+    assert!(body.get("include").is_none());
+    assert!(body.get("prompt_cache_key").is_none());
+    let input = body["input"].as_array().unwrap();
+    assert!(input.iter().all(|item| item["type"] != "reasoning"));
     server.finish();
 }
 
@@ -426,23 +458,6 @@ fn anthropic_eof_before_message_stop_is_an_error() {
     assert!(events
         .iter()
         .any(|event| matches!(event, AgentEvent::Error(message) if message.contains("终止事件"))));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, AgentEvent::TurnFinished { cancelled: false })));
-    server.finish();
-}
-
-#[test]
-fn chat_eof_before_done_is_an_error() {
-    let response = r#"data: {"id":"eof","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
-
-"#
-    .to_string();
-    let server = MockServer::start(vec![response]);
-    let events = run_agent_against("chat", server.port);
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, AgentEvent::Error(message) if message.contains("[DONE]"))));
     assert!(events
         .iter()
         .any(|event| matches!(event, AgentEvent::TurnFinished { cancelled: false })));

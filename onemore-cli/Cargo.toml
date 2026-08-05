@@ -1,6 +1,6 @@
 [package]
 name = "onemore"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Onemore: a reliable and practical coding agent"
 license = "MIT"
@@ -17,6 +17,8 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# 稳定提示词指纹与不含原文的 prompt cache key。
+sha2 = "0.10"
 # 每个会话一个 SQLite 数据库；bundled 保证用户无需预装 SQLite。
 rusqlite = { version = "0.32", features = ["bundled"] }
 # 会话文件名使用随机 UUID，既可跨进程生成，也不泄露路径信息。

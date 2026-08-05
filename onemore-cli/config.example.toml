@@ -21,6 +21,7 @@ commands = "ask"
 # ---- Anthropic Messages API ----
 [providers.anthropic]
 api = "messages"
+profile = "anthropic"
 base_url = "https://api.anthropic.com"
 model = "claude-sonnet-5"          # 也可: claude-opus-5 / claude-fable-5
 api_key_env = "ANTHROPIC_API_KEY"
@@ -31,27 +32,15 @@ context_window = 200000
 # ---- OpenAI Responses API(OpenAI 当前主推)----
 [providers.openai]
 api = "responses"
+profile = "openai"
 base_url = "https://api.openai.com/v1"
 model = "gpt-5"
 api_key_env = "OPENAI_API_KEY"
 
-# ---- 同一家也可以走 Chat Completions,对比学习用 ----
-[providers.openai-chat]
-api = "chat"
-base_url = "https://api.openai.com/v1"
-model = "gpt-5"
-api_key_env = "OPENAI_API_KEY"
-
-# ---- Chat Completions 兼容服务举例:DeepSeek ----
+# ---- DeepSeek Responses API ----
 [providers.deepseek]
-api = "chat"
-base_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"            # deepseek-reasoner 可以看到思考流
+api = "responses"
+profile = "deepseek-responses"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
 api_key_env = "DEEPSEEK_API_KEY"
-
-# ---- 本地模型举例:ollama(无需鉴权)----
-[providers.ollama]
-api = "chat"
-base_url = "http://127.0.0.1:11434/v1"
-model = "qwen3:8b"
-api_key = ""

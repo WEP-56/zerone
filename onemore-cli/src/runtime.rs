@@ -291,6 +291,7 @@ impl Agent {
                             entries,
                             input_tokens: usage.input_tokens,
                             output_tokens: usage.output_tokens,
+                            cache: usage.cache,
                         });
                     }
                     Err(e) => emit(AgentEvent::Error(format!("恢复会话失败: {:#}", e))),
@@ -413,7 +414,8 @@ impl Agent {
             return;
         }
 
-        let specs: Vec<ToolSpec> = self.tools.specs();
+        let mut specs: Vec<ToolSpec> = self.tools.specs();
+        specs.sort_by(|left, right| left.name.cmp(&right.name));
         let mut stop_hook_active = false;
         for _round in 0..self.config.max_turns {
             if cancel.load(Ordering::Relaxed) {
@@ -450,6 +452,7 @@ impl Agent {
             emit(AgentEvent::Usage {
                 input_tokens: self.usage_total.input_tokens,
                 output_tokens: self.usage_total.output_tokens,
+                cache: self.usage_total.cache,
             });
 
             // ---- 2. assistant 消息成为事实(携带本次真实 usage) ----
@@ -476,8 +479,11 @@ impl Agent {
                 return;
             }
             let assistant_message = output.message;
-            let assistant_payload =
-                SessionEntryPayload::message(assistant_message.clone(), Some(output.usage));
+            let assistant_payload = SessionEntryPayload::message_with_prompt(
+                assistant_message.clone(),
+                output.usage,
+                output.prompt_fingerprint,
+            );
 
             // ---- 3. 没有工具调用 → 当前任务将停止 ----
             if calls.is_empty() {
@@ -730,7 +736,7 @@ impl Agent {
     /// ToolUse/ToolResult 块与厂商 reasoning 回传项——这种"有 tool 块却无
     /// tools 声明"的请求形状在 Anthropic 上是显式 400,在 OpenAI 兼容后端/
     /// 网关上也常被拒(表现为 502)。对话在这里是被摘要的**数据**,不是要
-    /// 续写的上下文,纯文本才是对三种 API 都合法的形状。
+    /// 续写的上下文,纯文本才是对两种 API 都合法的形状。
     fn compact(&mut self, emit: &mut dyn FnMut(AgentEvent), cancel: &AtomicBool) {
         let projection = project_model_messages(&self.entries);
         let transcript = render_transcript_for_compaction(&projection.messages);
@@ -763,6 +769,7 @@ impl Agent {
                 emit(AgentEvent::Usage {
                     input_tokens: self.usage_total.input_tokens,
                     output_tokens: self.usage_total.output_tokens,
+                    cache: self.usage_total.cache,
                 });
                 if summary.is_empty() {
                     emit(AgentEvent::Error("压缩失败:模型返回了空摘要".into()));
@@ -1607,7 +1614,7 @@ provider = "mock"
 max_turns = {}
 
 [providers.mock]
-api = "chat"
+api = "responses"
 base_url = "http://127.0.0.1:1"
 model = "scripted"
 api_key = ""
@@ -1635,6 +1642,7 @@ api_key = ""
             message,
             usage: Usage::default(),
             stop,
+            prompt_fingerprint: None,
         }
     }
 
@@ -2175,8 +2183,10 @@ api_key = ""
                 usage: Usage {
                     input_tokens: 1200,
                     output_tokens: 34,
+                    cache: None,
                 },
                 stop: StopReason::EndTurn,
+                prompt_fingerprint: Some("sha256:test".into()),
             },
         )]));
         agent.handle_command(
@@ -2199,10 +2209,12 @@ api_key = ""
             assistant.usage,
             Some(Usage {
                 input_tokens: 1200,
-                output_tokens: 34
+                output_tokens: 34,
+                cache: None,
             }),
             "事实必须携带该次调用的真实 usage"
         );
+        assert_eq!(assistant.prompt_fingerprint.as_deref(), Some("sha256:test"));
         let projection = project_model_messages(&agent.entries);
         assert_eq!(projection.known_token_baseline, Some(1234));
         assert_eq!(projection.tail_chars_after_baseline, 0);

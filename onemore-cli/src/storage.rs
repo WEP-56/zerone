@@ -4,7 +4,7 @@
 //! - `config.toml` 是所有 workspace 共用的配置；
 //! - `sessions/<uuid>.db` 是一会话一库的 SQLite 事实日志。
 //!
-//! ## 事实日志(schema v2)
+//! ## 事实日志(schema v3)
 //! 数据库不再保存"最终模型消息",而是保存 [`SessionEntry`] 事实:
 //! 每条 entry 有 `id + parent_id + kind + payload`,payload 是厂商无关的
 //! [`SessionEntryPayload`] JSON。模型看到什么由 `session::project_model_messages`
@@ -15,7 +15,7 @@
 //! 2. **entry、leaf、统计在同一事务提交**:崩溃后不会出现"entry 写了一半、
 //!    leaf 指向不存在节点"的状态;带 ToolUse 的消息批在提交前还要过
 //!    [`validate_new_message_batch`],半批直接拒绝。
-//! 3. **旧库迁移原子化**:v1(线性 messages 表)在单个事务里迁移成 v2,
+//! 3. **旧库迁移原子化**:旧库在单个事务里迁移到当前 schema,
 //!    任何一步失败都回滚,原库保持可用。
 
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
-use crate::message::{Block, ChatMessage, Role, Usage};
+use crate::message::{Block, CacheUsage, ChatMessage, Role, Usage};
 use crate::session::{
     validate_new_message_batch, MessageRecord, SessionEntry, SessionEntryPayload,
 };
@@ -33,8 +33,9 @@ pub const APP_HOME_ENV: &str = "ONEMORE_HOME";
 pub const APP_DIR_NAME: &str = ".onemore";
 
 /// 当前 schema 版本。v1 = 线性 messages 表(无版本号,user_version=0);
-/// v2 = entries 事实日志 + session.leaf_id。
-const SCHEMA_VERSION: i64 = 2;
+/// v2 = entries 事实日志 + session.leaf_id;
+/// v3 = session cache_read_tokens/cache_write_tokens 累计值。
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -206,8 +207,9 @@ impl SessionStore {
         initialize(&mut connection)?;
         let now = unix_timestamp();
         connection.execute(
-            "INSERT INTO session (id, workspace, title, created_at, updated_at, input_tokens, output_tokens, leaf_id) \
-             VALUES (?1, ?2, '', ?3, ?3, 0, 0, NULL)",
+            "INSERT INTO session (id, workspace, title, created_at, updated_at, input_tokens, output_tokens, \
+             cache_read_tokens, cache_write_tokens, leaf_id) \
+             VALUES (?1, ?2, '', ?3, ?3, 0, 0, NULL, NULL, NULL)",
             params![id, workspace, now],
         )?;
         Ok(SessionStore {
@@ -320,12 +322,15 @@ impl SessionStore {
         tx.execute(
             "UPDATE session SET \
              title = CASE WHEN title = '' AND ?1 <> '' THEN ?1 ELSE title END, \
-             updated_at = ?2, input_tokens = ?3, output_tokens = ?4, leaf_id = ?5 WHERE id = ?6",
+             updated_at = ?2, input_tokens = ?3, output_tokens = ?4, \
+             cache_read_tokens = ?5, cache_write_tokens = ?6, leaf_id = ?7 WHERE id = ?8",
             params![
                 first_user_text,
                 now,
                 usage.input_tokens,
                 usage.output_tokens,
+                usage.cache.map(|cache| cache.read_tokens),
+                usage.cache.map(|cache| cache.write_tokens),
                 leaf,
                 self.id
             ],
@@ -341,7 +346,7 @@ impl SessionStore {
         tx.execute("DELETE FROM entries", [])?;
         tx.execute(
             "UPDATE session SET title = '', updated_at = ?1, input_tokens = 0, output_tokens = 0, \
-             leaf_id = NULL WHERE id = ?2",
+             cache_read_tokens = NULL, cache_write_tokens = NULL, leaf_id = NULL WHERE id = ?2",
             params![unix_timestamp(), self.id],
         )?;
         tx.commit()?;
@@ -374,12 +379,20 @@ impl SessionStore {
             });
         }
         let usage = self.connection.query_row(
-            "SELECT input_tokens, output_tokens FROM session WHERE id = ?1",
+            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens \
+             FROM session WHERE id = ?1",
             [&self.id],
             |row| {
                 Ok(Usage {
                     input_tokens: row.get(0)?,
                     output_tokens: row.get(1)?,
+                    cache: match (row.get(2)?, row.get(3)?) {
+                        (None, None) => None,
+                        (read_tokens, write_tokens) => Some(CacheUsage {
+                            read_tokens: read_tokens.unwrap_or(0),
+                            write_tokens: write_tokens.unwrap_or(0),
+                        }),
+                    },
                 })
             },
         )?;
@@ -435,7 +448,7 @@ fn has_table(connection: &Connection, name: &str) -> Result<bool> {
 }
 
 /// 建表与迁移。全部结构变更在单个事务内完成:
-/// - 全新库直接建 v2;
+/// - 全新库直接建当前 schema;
 /// - v1 库把 messages 逐条包装成 Message 事实迁入 entries,任何解析/写入失败
 ///   都会回滚,原库保持 v1 可用(验收:迁移失败保留原库)。
 fn initialize(connection: &mut Connection) -> Result<()> {
@@ -455,7 +468,9 @@ fn initialize(connection: &mut Connection) -> Result<()> {
              created_at INTEGER NOT NULL,
              updated_at INTEGER NOT NULL,
              input_tokens INTEGER NOT NULL,
-             output_tokens INTEGER NOT NULL
+             output_tokens INTEGER NOT NULL,
+             cache_read_tokens INTEGER,
+             cache_write_tokens INTEGER
          );
          CREATE TABLE IF NOT EXISTS entries (
              sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -468,6 +483,18 @@ fn initialize(connection: &mut Connection) -> Result<()> {
     )?;
     if !column_exists(&tx, "session", "leaf_id")? {
         tx.execute("ALTER TABLE session ADD COLUMN leaf_id TEXT", [])?;
+    }
+    if !column_exists(&tx, "session", "cache_read_tokens")? {
+        tx.execute(
+            "ALTER TABLE session ADD COLUMN cache_read_tokens INTEGER",
+            [],
+        )?;
+    }
+    if !column_exists(&tx, "session", "cache_write_tokens")? {
+        tx.execute(
+            "ALTER TABLE session ADD COLUMN cache_write_tokens INTEGER",
+            [],
+        )?;
     }
     if legacy {
         migrate_v1_messages(&tx)?;
@@ -509,6 +536,7 @@ fn migrate_v1_messages(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         let entry_payload = SessionEntryPayload::Message(MessageRecord {
             message,
             usage: None, // v1 没有逐消息 usage,只有会话累计。
+            prompt_fingerprint: None,
         });
         let id = uuid::Uuid::new_v4().to_string();
         tx.execute(
@@ -576,10 +604,14 @@ mod tests {
             .append_payloads(
                 vec![
                     message_payload(ChatMessage::user_text("第一条问题")),
-                    message_payload(ChatMessage {
-                        role: Role::Assistant,
-                        blocks: vec![Block::Text("回答".into())],
-                    }),
+                    SessionEntryPayload::message_with_prompt(
+                        ChatMessage {
+                            role: Role::Assistant,
+                            blocks: vec![Block::Text("回答".into())],
+                        },
+                        Usage::default(),
+                        Some("sha256:test".into()),
+                    ),
                     SessionEntryPayload::Notice(NoticeRecord {
                         text: "仅 UI 可见".into(),
                         level: NoticeLevel::Info,
@@ -588,6 +620,10 @@ mod tests {
                 Usage {
                     input_tokens: 12,
                     output_tokens: 7,
+                    cache: Some(CacheUsage {
+                        read_tokens: 8,
+                        write_tokens: 3,
+                    }),
                 },
             )
             .unwrap();
@@ -606,6 +642,11 @@ mod tests {
         assert_eq!(loaded.len(), 3);
         assert!(matches!(loaded[2].payload, SessionEntryPayload::Notice(_)));
         assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.cache.unwrap().read_tokens, 8);
+        let SessionEntryPayload::Message(assistant) = &loaded[1].payload else {
+            panic!("第二条事实应是 assistant message");
+        };
+        assert_eq!(assistant.prompt_fingerprint.as_deref(), Some("sha256:test"));
         other.clear().unwrap();
         assert!(other.load(&id).unwrap().0.is_empty());
         // 清空后可以继续追加(leaf 已复位)。
@@ -787,6 +828,39 @@ mod tests {
             )
             .unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v2_schema_gains_nullable_cache_usage_columns() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                     id TEXT PRIMARY KEY,
+                     workspace TEXT NOT NULL,
+                     title TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     input_tokens INTEGER NOT NULL,
+                     output_tokens INTEGER NOT NULL,
+                     leaf_id TEXT
+                 );
+                 CREATE TABLE entries (
+                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     id TEXT NOT NULL UNIQUE,
+                     parent_id TEXT,
+                     kind TEXT NOT NULL,
+                     payload TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+
+        initialize(&mut connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
+        assert!(column_exists(&connection, "session", "cache_read_tokens").unwrap());
+        assert!(column_exists(&connection, "session", "cache_write_tokens").unwrap());
     }
 
     #[test]

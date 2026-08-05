@@ -17,34 +17,66 @@ use serde::Deserialize;
 
 use crate::permission::{PermissionRule, PermissionRules};
 
-/// 三类接口。字符串来自 config 的 `api = "..."`。
+/// 两类接口。字符串来自 config 的 `api = "..."`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKind {
     /// Anthropic Messages API
     Messages,
-    /// OpenAI Chat Completions API(以及一切兼容它的服务)
-    Chat,
     /// OpenAI Responses API
     Responses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProfile {
+    OpenAiResponses,
+    AnthropicMessages,
+    DeepSeekResponses,
+    DeepSeekMessages,
+}
+
+impl ProviderProfile {
+    fn parse(value: Option<&str>, api: ApiKind) -> Result<Self> {
+        let profile = match value {
+            None => match api {
+                ApiKind::Messages => ProviderProfile::AnthropicMessages,
+                ApiKind::Responses => ProviderProfile::OpenAiResponses,
+            },
+            Some("openai") => ProviderProfile::OpenAiResponses,
+            Some("anthropic") => ProviderProfile::AnthropicMessages,
+            Some("deepseek-responses") => ProviderProfile::DeepSeekResponses,
+            Some("deepseek-messages") => ProviderProfile::DeepSeekMessages,
+            Some(other) => bail!(
+                "未知 provider profile {:?},可选: openai | anthropic | deepseek-responses | deepseek-messages",
+                other
+            ),
+        };
+        let valid = matches!(
+            (api, profile),
+            (ApiKind::Messages, ProviderProfile::AnthropicMessages)
+                | (ApiKind::Messages, ProviderProfile::DeepSeekMessages)
+                | (ApiKind::Responses, ProviderProfile::OpenAiResponses)
+                | (ApiKind::Responses, ProviderProfile::DeepSeekResponses)
+        );
+        if !valid {
+            bail!("provider profile 与 api 类型不匹配");
+        }
+        Ok(profile)
+    }
 }
 
 impl ApiKind {
     fn parse(s: &str) -> Result<ApiKind> {
         match s {
             "messages" => Ok(ApiKind::Messages),
-            "chat" => Ok(ApiKind::Chat),
             "responses" => Ok(ApiKind::Responses),
-            other => bail!(
-                "未知 api 类型 {:?},可选: messages | chat | responses",
-                other
-            ),
+            other => bail!("未知 api 类型 {:?},可选: messages | responses", other),
         }
     }
 
     fn default_key_env(&self) -> &'static str {
         match self {
             ApiKind::Messages => "ANTHROPIC_API_KEY",
-            ApiKind::Chat | ApiKind::Responses => "OPENAI_API_KEY",
+            ApiKind::Responses => "OPENAI_API_KEY",
         }
     }
 }
@@ -54,6 +86,7 @@ impl ApiKind {
 pub struct ProviderSettings {
     pub name: String,
     pub api: ApiKind,
+    pub profile: ProviderProfile,
     pub base_url: String,
     /// 空字符串 = 不发鉴权头。
     pub api_key: String,
@@ -102,6 +135,8 @@ struct AgentSection {
 #[derive(Debug, Deserialize, Clone)]
 struct ProviderSection {
     api: String,
+    #[serde(default)]
+    profile: Option<String>,
     base_url: String,
     model: String,
     #[serde(default)]
@@ -207,6 +242,7 @@ impl Config {
             )
         })?;
         let api = ApiKind::parse(&sec.api)?;
+        let profile = ProviderProfile::parse(sec.profile.as_deref(), api)?;
         let api_key = match &sec.api_key {
             Some(k) => k.clone(), // 允许 ""(无鉴权)
             None => {
@@ -227,6 +263,7 @@ impl Config {
         Ok(ProviderSettings {
             name: name.to_string(),
             api,
+            profile,
             base_url: sec.base_url.trim_end_matches('/').to_string(),
             api_key,
             model: sec.model.clone(),
@@ -272,6 +309,7 @@ commands = "ask"
 # ---- Anthropic Messages API ----
 [providers.anthropic]
 api = "messages"
+profile = "anthropic"
 base_url = "https://api.anthropic.com"
 model = "claude-sonnet-5"          # 也可: claude-opus-5 / claude-fable-5
 api_key_env = "ANTHROPIC_API_KEY"
@@ -282,35 +320,23 @@ context_window = 200000
 # ---- OpenAI Responses API(OpenAI 当前主推)----
 [providers.openai]
 api = "responses"
+profile = "openai"
 base_url = "https://api.openai.com/v1"
 model = "gpt-5"
 api_key_env = "OPENAI_API_KEY"
 
-# ---- 同一家也可以走 Chat Completions,对比学习用 ----
-[providers.openai-chat]
-api = "chat"
-base_url = "https://api.openai.com/v1"
-model = "gpt-5"
-api_key_env = "OPENAI_API_KEY"
-
-# ---- Chat Completions 兼容服务举例:DeepSeek ----
+# ---- DeepSeek Responses API ----
 [providers.deepseek]
-api = "chat"
-base_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"            # deepseek-reasoner 可以看到思考流
+api = "responses"
+profile = "deepseek-responses"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
 api_key_env = "DEEPSEEK_API_KEY"
-
-# ---- 本地模型举例:ollama(无需鉴权)----
-[providers.ollama]
-api = "chat"
-base_url = "http://127.0.0.1:11434/v1"
-model = "qwen3:8b"
-api_key = ""
 "#;
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_permission_rule, EXAMPLE_CONFIG};
+    use super::{parse_permission_rule, ApiKind, ProviderProfile, EXAMPLE_CONFIG};
     use crate::permission::PermissionRule;
 
     #[test]
@@ -328,5 +354,19 @@ mod tests {
             PermissionRule::Deny
         );
         assert!(parse_permission_rule(Some("maybe"), PermissionRule::Allow, "commands").is_err());
+    }
+
+    #[test]
+    fn chat_completions_is_not_a_supported_api_kind() {
+        assert!(ApiKind::parse("chat").is_err());
+    }
+
+    #[test]
+    fn provider_profiles_are_family_checked() {
+        assert_eq!(
+            ProviderProfile::parse(None, ApiKind::Responses).unwrap(),
+            ProviderProfile::OpenAiResponses
+        );
+        assert!(ProviderProfile::parse(Some("anthropic"), ApiKind::Responses).is_err());
     }
 }

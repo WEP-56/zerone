@@ -1,0 +1,11 @@
+# Reference snapshots are intentionally not part of the Onemore repository.
+/codex/
+/grok-build/
+/.pruned/
+
+# Generated output if a reference project is built locally.
+**/target/
+**/node_modules/
+**/dist/
+**/.cache/
+**/.next/

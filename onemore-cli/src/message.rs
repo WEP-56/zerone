@@ -2,7 +2,7 @@
 //!
 //! 这是 Onemore 最重要的设计决策:**内部只用一套消息表示**。
 //!
-//! 三种 API(Anthropic Messages / OpenAI Chat Completions / OpenAI Responses)
+//! 两种 API(Anthropic Messages / OpenAI Responses)
 //! 的报文格式差异很大,但语义上都是同一件事:
 //!
 //! - 用户说了一段话
@@ -22,8 +22,7 @@ use serde::{Deserialize, Serialize};
 /// 消息角色。注意没有 System / Tool 角色:
 /// - 系统提示由 `context/` 组装,在 provider 适配层落到各 API 对应的位置;
 /// - 工具结果是 User 消息里的 [`Block::ToolResult`](Anthropic 风格),
-///   Chat Completions 适配器会把它拆成 `role:"tool"` 消息,Responses 适配器
-///   会拆成 `function_call_output` item。
+///   Responses 适配器会把它拆成 `function_call_output` item。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     User,
@@ -57,7 +56,7 @@ pub enum Block {
     },
 
     /// 模型发起的一次工具调用。
-    /// `id` 用于和 ToolResult 配对(三种 API 都有这个概念,名字不同:
+    /// `id` 用于和 ToolResult 配对(两种 API 都有这个概念,名字不同:
     /// tool_use.id / tool_calls[].id / function_call.call_id)。
     /// `input` 是已解析的 JSON 参数;如果模型输出的参数不是合法 JSON,
     /// 会以 `Value::String(原文)` 存进来,让工具层报错并把错误回给模型自愈。
@@ -121,12 +120,25 @@ impl ChatMessage {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache: Option<CacheUsage>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheUsage {
+    pub read_tokens: u64,
+    pub write_tokens: u64,
 }
 
 impl Usage {
     pub fn add(&mut self, other: Usage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
+        if let Some(other_cache) = other.cache {
+            let cache = self.cache.get_or_insert_default();
+            cache.read_tokens += other_cache.read_tokens;
+            cache.write_tokens += other_cache.write_tokens;
+        }
     }
 }
 

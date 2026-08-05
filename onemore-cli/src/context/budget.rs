@@ -175,6 +175,7 @@ mod tests {
             Some(Usage {
                 input_tokens: input,
                 output_tokens: output,
+                cache: None,
             }),
         )
     }

@@ -6,21 +6,20 @@
 //! 实现 trait、在 [`build_provider`] 的 match 里加一行即可
 //! (见 docs/07-how-to-add-provider.md)。
 //!
-//! 三个适配器各自负责两件事(方向相反的两次翻译):
+//! 两个适配器各自负责两件事(方向相反的两次翻译):
 //! 1. 把统一消息模型(`message::ChatMessage/Block`)编码成该 API 的请求体;
 //! 2. 把该 API 的 SSE 流解码回统一模型 + 统一流事件。
 //!
-//! | 概念       | Messages(Anthropic)   | Chat Completions      | Responses(OpenAI)        |
-//! |-----------|------------------------|-----------------------|---------------------------|
-//! | 端点       | /v1/messages           | /v1/chat/completions  | /v1/responses             |
-//! | 系统提示   | 顶层 system 字段        | messages[0] role=system | 顶层 instructions 字段  |
-//! | 工具声明   | {name,input_schema}    | {type:function,function:{...}} | {type:function,...} 平铺 |
-//! | 工具调用   | tool_use 内容块         | tool_calls 数组        | function_call 输出项       |
-//! | 工具结果   | user 消息内 tool_result | role:"tool" 消息       | function_call_output 输入项|
-//! | 流结束     | message_stop 事件       | data: [DONE]           | response.completed 事件    |
+//! | 概念       | Messages(Anthropic)   | Responses(OpenAI)        |
+//! |-----------|------------------------|---------------------------|
+//! | 端点       | /v1/messages           | /v1/responses             |
+//! | 系统提示   | 顶层 system 字段        | 顶层 instructions 字段   |
+//! | 工具声明   | {name,input_schema}    | {type:function,...} 平铺  |
+//! | 工具调用   | tool_use 内容块         | function_call 输出项      |
+//! | 工具结果   | user 消息内 tool_result | function_call_output 输入项 |
+//! | 流结束     | message_stop 事件       | response.completed 事件   |
 
 pub mod anthropic;
-pub mod openai_chat;
 pub mod openai_responses;
 pub mod sse;
 
@@ -29,11 +28,49 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use crate::config::{ApiKind, ProviderSettings};
+use crate::config::{ApiKind, ProviderProfile, ProviderSettings};
 use crate::context::PromptContext;
 use crate::message::{ChatMessage, StopReason, Usage};
 use crate::tools::ToolSpec;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    pub encrypted_reasoning_replay: bool,
+    pub reasoning_summary_stream: bool,
+    pub reasoning_text_stream: bool,
+    pub prompt_cache_key: bool,
+    pub explicit_cache_control: bool,
+    pub canonical_version_header: bool,
+}
+
+impl ProviderProfile {
+    pub fn capabilities(self) -> ProviderCapabilities {
+        match self {
+            ProviderProfile::OpenAiResponses => ProviderCapabilities {
+                encrypted_reasoning_replay: true,
+                reasoning_summary_stream: true,
+                prompt_cache_key: true,
+                ..ProviderCapabilities::default()
+            },
+            ProviderProfile::AnthropicMessages => ProviderCapabilities {
+                reasoning_text_stream: true,
+                explicit_cache_control: true,
+                canonical_version_header: true,
+                ..ProviderCapabilities::default()
+            },
+            ProviderProfile::DeepSeekResponses => ProviderCapabilities {
+                reasoning_text_stream: true,
+                ..ProviderCapabilities::default()
+            },
+            ProviderProfile::DeepSeekMessages => ProviderCapabilities {
+                reasoning_text_stream: true,
+                ..ProviderCapabilities::default()
+            },
+        }
+    }
+}
 
 /// 流式过程中发给上层的增量事件(Runtime 会转成 AgentEvent)。
 #[derive(Debug, Clone)]
@@ -52,6 +89,7 @@ pub struct TurnOutput {
     pub message: ChatMessage,
     pub usage: Usage,
     pub stop: StopReason,
+    pub prompt_fingerprint: Option<String>,
 }
 
 /// Provider 层错误。`retryable` 标记网络/限流/服务端故障这类
@@ -127,13 +165,83 @@ impl FailedTurn {
 pub fn build_provider(settings: ProviderSettings) -> Box<dyn Provider> {
     match settings.api {
         ApiKind::Messages => Box::new(anthropic::AnthropicProvider::new(settings)),
-        ApiKind::Chat => Box::new(openai_chat::ChatProvider::new(settings)),
         ApiKind::Responses => Box::new(openai_responses::ResponsesProvider::new(settings)),
     }
 }
 
+fn profile_id(profile: ProviderProfile) -> &'static str {
+    match profile {
+        ProviderProfile::OpenAiResponses => "openai-responses",
+        ProviderProfile::AnthropicMessages => "anthropic-messages",
+        ProviderProfile::DeepSeekResponses => "deepseek-responses",
+        ProviderProfile::DeepSeekMessages => "deepseek-messages",
+    }
+}
+
+pub(crate) fn sorted_tools(tools: &[ToolSpec]) -> Vec<&ToolSpec> {
+    let mut tools = tools.iter().collect::<Vec<_>>();
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    tools
+}
+
+fn canonical_tools(tools: &[ToolSpec]) -> Vec<Value> {
+    sorted_tools(tools)
+        .into_iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "schema": tool.schema,
+            })
+        })
+        .collect()
+}
+
+fn sha256_hex(value: &Value) -> String {
+    let digest = Sha256::digest(value.to_string().as_bytes());
+    digest.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+pub(crate) fn prompt_fingerprint(
+    profile: ProviderProfile,
+    model: &str,
+    prompt: &PromptContext,
+    tools: &[ToolSpec],
+) -> String {
+    let semantic_prompt = serde_json::json!({
+        "version": 1,
+        "profile": profile_id(profile),
+        "model": model,
+        "system": prompt.system_text(),
+        "tools": canonical_tools(tools),
+        "messages": prompt.messages,
+    });
+    format!("sha256:{}", sha256_hex(&semantic_prompt))
+}
+
+pub(crate) fn prompt_cache_key(
+    profile: ProviderProfile,
+    model: &str,
+    prompt: &PromptContext,
+    tools: &[ToolSpec],
+) -> String {
+    let stable_prefix = serde_json::json!({
+        "version": 1,
+        "profile": profile_id(profile),
+        "model": model,
+        "system": prompt.system_text(),
+        "tools": canonical_tools(tools),
+    });
+    format!(
+        "onemore:v1:{}:{}:{}",
+        profile_id(profile),
+        model,
+        sha256_hex(&stable_prefix)
+    )
+}
+
 // ---------------------------------------------------------------------------
-// 三个适配器共用的 HTTP 与小工具
+// 两个适配器共用的 HTTP 与小工具
 // ---------------------------------------------------------------------------
 
 /// 构造带超时与代理的 HTTP agent。
@@ -289,7 +397,7 @@ pub(crate) fn url_join(base: &str, versioned_path: &str) -> String {
     }
 }
 
-/// ToolUse 的 input 序列化成参数字符串(Chat/Responses 的工具参数是字符串)。
+/// ToolUse 的 input 序列化成参数字符串(Responses 的工具参数是字符串)。
 /// input 若本来就是 String(上次解析失败留下的原文),原样送回。
 pub(crate) fn args_to_string(input: &Value) -> String {
     match input {
@@ -319,6 +427,19 @@ pub(crate) fn args_to_object(input: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderProfile;
+    use crate::message::ChatMessage;
+    use crate::tools::{ToolCapabilities, ToolPermissionSpec};
+
+    fn tool(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: format!("{} description", name),
+            schema: serde_json::json!({"type":"object","properties":{}}),
+            capabilities: ToolCapabilities::READ_ONLY,
+            permission: ToolPermissionSpec::default(),
+        }
+    }
 
     #[test]
     fn url_join_handles_v1() {
@@ -327,12 +448,8 @@ mod tests {
             "https://api.anthropic.com/v1/messages"
         );
         assert_eq!(
-            url_join("https://api.openai.com/v1", "v1/chat/completions"),
-            "https://api.openai.com/v1/chat/completions"
-        );
-        assert_eq!(
-            url_join("http://localhost:11434/v1/", "v1/chat/completions"),
-            "http://localhost:11434/v1/chat/completions"
+            url_join("https://api.openai.com/v1", "v1/responses"),
+            "https://api.openai.com/v1/responses"
         );
     }
 
@@ -341,6 +458,47 @@ mod tests {
         assert_eq!(parse_args(""), serde_json::json!({}));
         assert_eq!(parse_args("{\"a\":1}"), serde_json::json!({"a":1}));
         assert!(matches!(parse_args("{broken"), Value::String(_)));
+    }
+
+    #[test]
+    fn prompt_identity_is_deterministic_and_separates_key_from_messages() {
+        let mut first = PromptContext::default();
+        first.system_sections.push("stable system".into());
+        first.messages.push(ChatMessage::user_text("first turn"));
+        let mut second = first.clone();
+        second.messages.push(ChatMessage::user_text("second turn"));
+        let tools = vec![tool("zeta"), tool("alpha")];
+        let reversed = vec![tool("alpha"), tool("zeta")];
+
+        let first_fingerprint =
+            prompt_fingerprint(ProviderProfile::OpenAiResponses, "gpt-test", &first, &tools);
+        assert_eq!(
+            first_fingerprint,
+            prompt_fingerprint(
+                ProviderProfile::OpenAiResponses,
+                "gpt-test",
+                &first,
+                &reversed,
+            )
+        );
+        assert_ne!(
+            first_fingerprint,
+            prompt_fingerprint(
+                ProviderProfile::OpenAiResponses,
+                "gpt-test",
+                &second,
+                &tools,
+            )
+        );
+        assert_eq!(
+            prompt_cache_key(ProviderProfile::OpenAiResponses, "gpt-test", &first, &tools,),
+            prompt_cache_key(
+                ProviderProfile::OpenAiResponses,
+                "gpt-test",
+                &second,
+                &reversed,
+            )
+        );
     }
 
     #[test]

@@ -162,7 +162,17 @@ fn run_once(mut agent: Agent, prompt: String) -> Result<()> {
             AgentEvent::Usage {
                 input_tokens,
                 output_tokens,
-            } => eprintln!("· 用量 ↑{} ↓{}", input_tokens, output_tokens),
+                cache,
+            } => {
+                if let Some(cache) = cache {
+                    eprintln!(
+                        "· 用量 ↑{} ↓{} · cache read {} write {}",
+                        input_tokens, output_tokens, cache.read_tokens, cache.write_tokens
+                    );
+                } else {
+                    eprintln!("· 用量 ↑{} ↓{}", input_tokens, output_tokens);
+                }
+            }
             AgentEvent::Notice(t) => eprintln!("· {}", t),
             AgentEvent::Error(t) => {
                 failed = true;

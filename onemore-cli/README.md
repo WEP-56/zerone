@@ -1,5 +1,11 @@
 # Onemore
 
+## Design Documents
+
+- [提示词缓存设计](docs/prompt-cache.md)
+- [API 兼容性与 Chat Completions 删除](docs/api-compatibility.md)
+- [CacheBoard 测试项目需求书](docs/cacheboard-test-project-cn.md)
+
 Onemore 是从 Zerone 教学基线迁移出的独立 coding agent 工程,并已按
 [project.md](project.md) 的路线完成 1-6 阶段的工程化改造:Provider 终止协议、
 类型化工具管线、权限与 Hook、事实日志与上下文预算、steering/follow-up 队列、
@@ -11,7 +17,7 @@ Onemore 是从 Zerone 教学基线迁移出的独立 coding agent 工程,并已�
 ```powershell
 cargo run
 cargo run -- --once "你好"
-cargo run -- -p ds-chat
+cargo run -- -p deepseek
 ```
 
 首次运行会生成 `~/.onemore/config.toml`. 也可以设置 `ONEMORE_HOME` 将配置和会话
@@ -38,8 +44,7 @@ TUI 内常用操作:
 ## 与 Zerone 的区别
 
 Zerone 是刻意压低复杂度的可运行基线;Onemore 在同一架构骨架上补齐了工程化契约。
-未变的部分:统一消息模型 `ChatMessage/Block`、三种 API(Messages / Chat
-Completions / Responses)适配边界、`AgentCommand/AgentEvent` 事件流与双前端
+未变的部分:统一消息模型 `ChatMessage/Block`、两种 API(Messages / Responses)适配边界、`AgentCommand/AgentEvent` 事件流与双前端
 (TUI + `--once`)、工具必须经 `Workspace` 访问文件、一会话一 SQLite 库。
 
 ### 1. Provider:从"可能静默成功"到终止完备协议(阶段 1)
@@ -48,7 +53,7 @@ Completions / Responses)适配边界、`AgentCommand/AgentEvent` 事件流与双
   EOF 后可能把半截流当正常回答。
 - Onemore:每次调用必然终止于 `StreamTerminal::{Done, Error, Aborted}` 之一;
   EOF 而无终止事件一律是错误;失败路径也携带可消费的 final assistant
-  (`FailedTurn`)。三种适配器都有 EOF 断流 wire 测试锁定该行为。
+  (`FailedTurn`)。两个适配器都有 EOF 断流 wire 测试锁定该行为。
 - 重试收敛为 `RetryPolicy` 纯函数:指数退避 + 确定性 jitter + 上限,
   解析 `retry-after-ms`/`retry-after`,服务器要求等待超过 60s 直接放弃;
   "只有未产生任何流事件的失败才重试"的幂等前提不变。
@@ -81,7 +86,7 @@ Completions / Responses)适配边界、`AgentCommand/AgentEvent` 事件流与双
 
 - Zerone:屏幕历史 = 运行历史 = 持久历史 = 模型上下文,四者是同一个
   `Vec<ChatMessage>` 全量发送;SQLite 只存最终模型消息。
-- Onemore:持久层是 append-only 的事实日志(schema v2):
+- Onemore:持久层是 append-only 的事实日志(schema v3):
   `SessionEntry { id, parent_id, kind, payload }`,payload 分
   `Message(含该次真实 usage) / Notice / Compaction / ModelChange / Artifact`。
   entry、链尾(leaf)与统计在同一事务提交;带 ToolUse 的消息批在提交边界
@@ -136,6 +141,7 @@ outside_workspace = "ask"
 commands = "ask"
 
 [providers.xxx]
+profile = "openai"             # openai | anthropic | deepseek-responses | deepseek-messages
 context_window = 200000        # 可选:配置后启用上下文预算与 /compact 提示
 ```
 
@@ -145,12 +151,12 @@ context_window = 200000        # 可选:配置后启用上下文预算与 /compa
 ~/.onemore/
   config.toml
   sessions/
-    <session-id>.db            # schema v2:entries 事实日志 + session 元数据
+    <session-id>.db            # schema v3:事实日志 + token/cache 累计用量
 ```
 
 Onemore 不读取 `~/.zerone`,也不识别 `ZERONE_HOME`,因此两个程序的配置、密钥和会话
 互不污染。每个会话仍使用独立 SQLite 数据库,并按 workspace 隔离;v1(线性
-messages 表)数据库在打开时自动迁移为 v2,迁移失败回滚、原库保持可用。
+messages 表)数据库在打开时自动迁移到当前 schema,迁移失败回滚、原库保持可用。
 
 ## npm 包
 
@@ -158,7 +164,7 @@ messages 表)数据库在打开时自动迁移为 v2,迁移失败回滚、原库
 
 ```powershell
 .\scripts\package-npm.ps1 -Pack
-npm install --global .\dist\npm\onemore-agent-0.1.0.tgz
+npm install --global .\dist\npm\onemore-agent-0.2.0.tgz
 onemore --help
 ```
 
@@ -168,7 +174,7 @@ onemore --help
 
 ```powershell
 cargo fmt --check
-cargo test --locked          # 112 单测 + 6 wire 测试
+cargo test --locked          # 115 单测 + 5 wire 测试
 cargo build --release --locked
 .\scripts\package-npm.ps1 -Pack
 ```

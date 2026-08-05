@@ -26,7 +26,23 @@ pub enum SessionEntryPayload {
 
 impl SessionEntryPayload {
     pub fn message(message: ChatMessage, usage: Option<Usage>) -> Self {
-        SessionEntryPayload::Message(MessageRecord { message, usage })
+        SessionEntryPayload::Message(MessageRecord {
+            message,
+            usage,
+            prompt_fingerprint: None,
+        })
+    }
+
+    pub fn message_with_prompt(
+        message: ChatMessage,
+        usage: Usage,
+        prompt_fingerprint: Option<String>,
+    ) -> Self {
+        SessionEntryPayload::Message(MessageRecord {
+            message,
+            usage: Some(usage),
+            prompt_fingerprint,
+        })
     }
 
     pub fn kind(&self) -> &'static str {
@@ -44,6 +60,8 @@ impl SessionEntryPayload {
 pub struct MessageRecord {
     pub message: ChatMessage,
     pub usage: Option<Usage>,
+    #[serde(default)]
+    pub prompt_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 //! SSE(Server-Sent Events)解析器。
 //!
-//! 三种 API 的流式响应都是 SSE,格式差异只在事件内容,所以解析器只有一个:
+//! 两种 API 的流式响应都是 SSE,格式差异只在事件内容,所以解析器只有一个:
 //!
 //! ```text
 //! event: content_block_delta          ← 可选的事件名(Anthropic/Responses 用)
