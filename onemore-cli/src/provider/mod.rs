@@ -179,16 +179,11 @@ pub(crate) fn post_sse(
     match req.send_string(&body.to_string()) {
         Ok(resp) => Ok(resp.into_reader()),
         Err(ureq::Error::Status(code, resp)) => {
-            // 毫秒头(Anthropic 等)优先于秒级标准头。
-            let retry_after = resp
-                .header("retry-after-ms")
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(Duration::from_millis)
-                .or_else(|| {
-                    resp.header("retry-after")
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(Duration::from_secs)
-                });
+            let retry_after = retry_after_hint(
+                code,
+                resp.header("retry-after-ms"),
+                resp.header("retry-after"),
+            );
             let text = resp.into_string().unwrap_or_default();
             Err(ProviderError {
                 message: format!("HTTP {}: {}", code, extract_api_error(&text)),
@@ -204,8 +199,31 @@ pub(crate) fn post_sse(
     }
 }
 
+/// 解析服务器建议的等待时长。只在 Retry-After 语义成立的状态码
+/// (429 限流、503 过载、408 超时)上采信;网关 502 之类的错误页也常
+/// 携带 `Retry-After: 60`,那是 CDN 模板噪声,采信它会让重试白等一分钟,
+/// 应改走自家指数退避。毫秒头(Anthropic 等)优先于秒级标准头。
+fn retry_after_hint(
+    status: u16,
+    ms_header: Option<&str>,
+    secs_header: Option<&str>,
+) -> Option<Duration> {
+    if !matches!(status, 408 | 429 | 503) {
+        return None;
+    }
+    ms_header
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .or_else(|| {
+            secs_header
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs)
+        })
+}
+
 /// 从错误响应体里挖出人话。兼容两种主流形状:
 /// OpenAI `{"error":{"message":...}}`、Anthropic `{"error":{"type":..,"message":...}}`。
+/// 网关/CDN 的 HTML 错误页只保留 `<title>`,绝不把整页标签倒进通知栏。
 fn extract_api_error(body: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
         for path in [&["error", "message"][..], &["message"][..]] {
@@ -229,10 +247,35 @@ fn extract_api_error(body: &str) -> String {
     }
     let trimmed = body.trim();
     if trimmed.is_empty() {
-        "(空响应体)".to_string()
-    } else {
-        crate::util::ellipsis(trimmed, 400)
+        return "(空响应体)".to_string();
     }
+    if looks_like_html(trimmed) {
+        return match html_title(trimmed) {
+            Some(title) => format!("{}(HTML 错误页,正文已省略)", title),
+            None => format!("(HTML 错误页,{} 字符,已省略)", trimmed.chars().count()),
+        };
+    }
+    crate::util::ellipsis(&collapse_whitespace(trimmed), 400)
+}
+
+fn looks_like_html(body: &str) -> bool {
+    let head: String = body.chars().take(256).collect::<String>().to_lowercase();
+    head.starts_with("<!doctype html") || head.starts_with("<html") || head.contains("<html")
+}
+
+/// 取 `<title>` 内容(大小写不敏感,折叠空白,限长)。
+fn html_title(body: &str) -> Option<String> {
+    let lower = body.to_lowercase();
+    let open = lower.find("<title")?;
+    let open_end = body[open..].find('>')? + open + 1;
+    let close = lower[open_end..].find("</title>")? + open_end;
+    let title = collapse_whitespace(body[open_end..close].trim());
+    (!title.is_empty()).then(|| crate::util::ellipsis(&title, 120))
+}
+
+/// 把连续空白(含换行)折叠成单个空格,保证错误信息是干净的一行。
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// 拼接 API URL:兼容 base_url 带不带 `/v1` 两种写法。
@@ -298,5 +341,47 @@ mod tests {
         assert_eq!(parse_args(""), serde_json::json!({}));
         assert_eq!(parse_args("{\"a\":1}"), serde_json::json!({"a":1}));
         assert!(matches!(parse_args("{broken"), Value::String(_)));
+    }
+
+    #[test]
+    fn retry_after_is_only_trusted_on_rate_limit_statuses() {
+        assert_eq!(
+            retry_after_hint(429, Some("2500"), None),
+            Some(Duration::from_millis(2500))
+        );
+        assert_eq!(
+            retry_after_hint(503, None, Some("7")),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            retry_after_hint(408, None, Some("3")),
+            Some(Duration::from_secs(3))
+        );
+        // 网关错误页(502 等)上的 Retry-After 是 CDN 模板噪声,不采信,
+        // 让上层走自家指数退避而不是白等一分钟。
+        assert_eq!(retry_after_hint(502, Some("60000"), Some("60")), None);
+        assert_eq!(retry_after_hint(500, None, Some("60")), None);
+    }
+
+    #[test]
+    fn html_error_pages_reduce_to_title_not_markup() {
+        let cloudflare = "<!DOCTYPE html>\n<html lang=\"en-US\"><head>\n  <title>weppp.cyou | 502: Bad gateway</title>\n</head><body>very long markup body</body></html>";
+        assert_eq!(
+            extract_api_error(cloudflare),
+            "weppp.cyou | 502: Bad gateway(HTML 错误页,正文已省略)"
+        );
+        let untitled = "<html><body>oops</body></html>";
+        let rendered = extract_api_error(untitled);
+        assert!(rendered.contains("HTML 错误页"), "{rendered}");
+        assert!(!rendered.contains("<body>"), "不得泄漏标签: {rendered}");
+        // JSON 与纯文本路径不受影响;多行文本折叠成单行。
+        assert_eq!(
+            extract_api_error(r#"{"error":{"message":"quota exceeded"}}"#),
+            "quota exceeded"
+        );
+        assert_eq!(
+            extract_api_error("line one\n   line two"),
+            "line one line two"
+        );
     }
 }

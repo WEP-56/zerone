@@ -80,8 +80,10 @@ if ($ArtifactsDir) {
         }
     }
 } else {
-    $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-    if ($architecture -eq "x64") { $architecture = "x64" }
+    $architecture = $env:PROCESSOR_ARCHITECTURE.ToLowerInvariant()
+    if ($architecture -eq "amd64") {
+    $architecture = "x64"
+}
     elseif ($architecture -eq "arm64") { $architecture = "arm64" }
     else { throw "Unsupported local architecture: $architecture" }
 
