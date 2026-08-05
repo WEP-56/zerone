@@ -26,9 +26,9 @@ use serde_json::{json, Value};
 
 use super::{
     args_to_object, http_agent, parse_args, post_sse, sse::SseReader, FailedTurn, Provider,
-    ProviderError, ProviderEvent, StreamTerminal, TurnOutput,
+    ProviderError, ProviderEvent, ReasoningEffortFormat, StreamTerminal, TurnOutput,
 };
-use crate::config::ProviderSettings;
+use crate::config::{ProviderSettings, ReasoningEffortPolicy};
 use crate::context::PromptContext;
 use crate::message::{Block, CacheUsage, ChatMessage, Role, StopReason, Usage};
 use crate::tools::ToolSpec;
@@ -76,8 +76,22 @@ impl AnthropicProvider {
                             content.push(json!({"type": "text", "text": t}));
                         }
                     }
-                    // 未启用 extended thinking,历史里的思考块不回传
-                    // (Anthropic 要求回传的 thinking 必须带原始签名,启用时再扩展)
+                    Block::Thinking {
+                        text,
+                        provider_kind,
+                        raw: Some(raw),
+                    } if matches!(
+                        &self.settings.reasoning_effort,
+                        ReasoningEffortPolicy::Send(_)
+                    ) && provider_kind.as_deref() == Some("anthropic")
+                        && raw.get("signature").and_then(Value::as_str).is_some() =>
+                    {
+                        content.push(json!({
+                            "type": "thinking",
+                            "thinking": text,
+                            "signature": raw["signature"],
+                        }));
+                    }
                     Block::Thinking { .. } => {}
                     Block::ToolUse { id, name, input } => {
                         content.push(json!({
@@ -124,6 +138,14 @@ impl AnthropicProvider {
             "messages": messages,
             "stream": true,
         });
+        if self.settings.profile.capabilities().reasoning_effort_format
+            == ReasoningEffortFormat::AnthropicAdaptive
+        {
+            if let ReasoningEffortPolicy::Send(effort) = &self.settings.reasoning_effort {
+                body["thinking"] = json!({"type": "adaptive"});
+                body["output_config"] = json!({"effort": effort});
+            }
+        }
         let system = prompt.system_text();
         if !system.is_empty() {
             body["system"] = json!(system);
@@ -149,7 +171,10 @@ impl AnthropicProvider {
 /// 流式过程中"半成品"内容块(按 index 归位)。
 enum Partial {
     Text(String),
-    Thinking(String),
+    Thinking {
+        text: String,
+        signature: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -159,15 +184,14 @@ enum Partial {
 
 impl Provider for AnthropicProvider {
     fn label(&self) -> String {
-        format!("{} / {}", self.settings.name, self.settings.model)
+        format!(
+            "{} / {} / effort={}",
+            self.settings.name, self.settings.model, self.settings.selected_effort
+        )
     }
 
     fn model(&self) -> &str {
         &self.settings.model
-    }
-
-    fn set_model(&mut self, model: String) {
-        self.settings.model = model;
     }
 
     fn stream_turn(
@@ -204,8 +228,13 @@ impl AnthropicProvider {
             headers.push(("anthropic-version", API_VERSION.to_string()));
         }
         let body = self.build_body(prompt, tools);
-        let prompt_fingerprint =
-            super::prompt_fingerprint(self.settings.profile, &self.settings.model, prompt, tools);
+        let prompt_fingerprint = super::prompt_fingerprint(
+            self.settings.profile,
+            &self.settings.model,
+            &self.settings.reasoning_effort,
+            prompt,
+            tools,
+        );
         let reader = post_sse(&self.agent, &url, &headers, &body)?;
         let mut sse = SseReader::new(reader);
 
@@ -255,7 +284,13 @@ impl AnthropicProvider {
                             partials.insert(index, Partial::Text(String::new()));
                         }
                         "thinking" => {
-                            partials.insert(index, Partial::Thinking(String::new()));
+                            partials.insert(
+                                index,
+                                Partial::Thinking {
+                                    text: cb["thinking"].as_str().unwrap_or("").to_string(),
+                                    signature: cb["signature"].as_str().unwrap_or("").to_string(),
+                                },
+                            );
                         }
                         "tool_use" => {
                             let name = cb["name"].as_str().unwrap_or("").to_string();
@@ -285,10 +320,17 @@ impl AnthropicProvider {
                         }
                         "thinking_delta" => {
                             let piece = delta["thinking"].as_str().unwrap_or("");
-                            if let Some(Partial::Thinking(buf)) = partials.get_mut(&index) {
-                                buf.push_str(piece);
+                            if let Some(Partial::Thinking { text, .. }) = partials.get_mut(&index) {
+                                text.push_str(piece);
                             }
                             on_event(ProviderEvent::ThinkingDelta(piece.to_string()));
+                        }
+                        "signature_delta" => {
+                            if let Some(Partial::Thinking { signature, .. }) =
+                                partials.get_mut(&index)
+                            {
+                                signature.push_str(delta["signature"].as_str().unwrap_or(""));
+                            }
                         }
                         "input_json_delta" => {
                             if let Some(Partial::ToolUse { args, .. }) = partials.get_mut(&index) {
@@ -303,10 +345,11 @@ impl AnthropicProvider {
                     if let Some(p) = partials.remove(&index) {
                         blocks.push(match p {
                             Partial::Text(t) => Block::Text(t),
-                            Partial::Thinking(t) => Block::Thinking {
-                                text: t,
+                            Partial::Thinking { text, signature } => Block::Thinking {
+                                text,
                                 provider_kind: Some("anthropic".to_string()),
-                                raw: None,
+                                raw: (!signature.is_empty())
+                                    .then(|| json!({"signature": signature})),
                             },
                             Partial::ToolUse { id, name, args } => Block::ToolUse {
                                 id,
@@ -352,10 +395,10 @@ impl AnthropicProvider {
         for (_, p) in partials {
             blocks.push(match p {
                 Partial::Text(t) => Block::Text(t),
-                Partial::Thinking(t) => Block::Thinking {
-                    text: t,
+                Partial::Thinking { text, signature } => Block::Thinking {
+                    text,
                     provider_kind: Some("anthropic".to_string()),
-                    raw: None,
+                    raw: (!signature.is_empty()).then(|| json!({"signature": signature})),
                 },
                 Partial::ToolUse { id, name, args } => Block::ToolUse {
                     id,
@@ -392,6 +435,8 @@ mod tests {
             model: "claude-sonnet-5".into(),
             max_tokens: None,
             context_window: None,
+            selected_effort: "medium".into(),
+            reasoning_effort: ReasoningEffortPolicy::Omit,
         })
     }
 
@@ -455,5 +500,39 @@ mod tests {
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn adaptive_effort_and_signed_thinking_are_encoded_together() {
+        let mut prompt = PromptContext::default();
+        prompt.messages.push(ChatMessage {
+            role: Role::Assistant,
+            blocks: vec![
+                Block::Thinking {
+                    text: "先检查上下文".into(),
+                    provider_kind: Some("anthropic".into()),
+                    raw: Some(json!({"signature": "signed-value"})),
+                },
+                Block::Text("结果".into()),
+            ],
+        });
+
+        let omitted = provider().build_body(&prompt, &[]);
+        assert!(omitted.get("thinking").is_none());
+        assert!(omitted.get("output_config").is_none());
+        assert_eq!(omitted["messages"][0]["content"][0]["type"], "text");
+
+        let mut settings = provider().settings;
+        settings.selected_effort = "high".into();
+        settings.reasoning_effort = ReasoningEffortPolicy::Send("high".into());
+        let body = AnthropicProvider::new(settings).build_body(&prompt, &[]);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "thinking");
+        assert_eq!(
+            body["messages"][0]["content"][0]["signature"],
+            "signed-value"
+        );
+        assert!(body.get("reasoning").is_none());
     }
 }

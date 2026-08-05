@@ -60,6 +60,11 @@ Prompt Cache 重用的是精确 Token 前缀对应的 Attention KV 状态，而�
 
 即使这些操作会导致缓存未命中，也必须确保其行为正确。
 
+Reasoning effort 使用两套彼此分离的标识：完整诊断 Fingerprint 包含解析后的
+effort 策略，使 `Omit`、`medium`、`none`、`high` 可审计地区分；稳定的 OpenAI
+Prompt Family Cache Key 不包含 effort，因为 effort 改变生成行为，不改变可复用的
+输入 Token 前缀。加密 reasoning 回放也不受“是否发送 effort 字段”影响。
+
 ## Provider 策略
 
 不能根据 Endpoint 名称推断提供商是否支持缓存。
@@ -168,7 +173,8 @@ onemore:v1:<provider>:<model>:<workspace-policy>:<system>:<toolset>
 
 - 不返回缓存用量数据的提供商，其行为与以前完全一致；
 - 永远不发送提供商不支持的缓存字段；
-- 具有相同连续提示词前缀的请求，必须生成相同的本地 Fingerprint；
+- 提示词前缀与生成设置都相同的请求，必须生成相同的本地 Fingerprint；
+- 只改变 reasoning effort 时，完整 Fingerprint 应变化，稳定 Prompt Family Cache Key 不应变化；
 - 缓存未命中不能改变消息、工具调用、权限或 Session Facts；
 - Wire Fixture 必须验证缓存用量解析以及提供商专用的请求结构。
 

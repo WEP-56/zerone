@@ -27,7 +27,7 @@ mod input;
 mod picker;
 mod transcript;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -41,6 +41,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::{Frame, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
+use crate::config::{
+    ActiveModelSelection, ModelCatalogEntry, ProviderCatalogEntry, DEFAULT_REASONING_EFFORT,
+};
 use crate::event::{AgentCommand, AgentEvent};
 use crate::message::{Block as MessageBlock, ChatMessage, Role, Usage};
 use crate::permission::{ApprovalDecision, ApprovalRequest, ApprovalResponse, ApprovalScope};
@@ -57,7 +60,8 @@ const INPUT_MAX_ROWS: usize = 6;
 /// Inline viewport 只承载 live 内容和 composer；已完成消息在原生 scrollback 中。
 const INLINE_VIEWPORT_ROWS: u16 = 8;
 const HELP_TEXT: &str = "斜杠命令\n\
-  /model             选择或输入模型\n\
+  /model             选择当前 provider 的模型与思考程度\n\
+  /reasoning         调整当前模型的思考程度\n\
   /provider          选择 provider(对话历史保留)\n\
   /session [ID]      列出或恢复历史会话\n\
   /compact           压缩历史(摘要替代模型视图,事实保留)\n\
@@ -73,15 +77,37 @@ const HELP_TEXT: &str = "斜杠命令\n\
 enum PickerKind {
     Provider,
     Model,
+    Reasoning,
     Session,
 }
 
 #[derive(Debug)]
 enum Overlay {
-    Picker { kind: PickerKind, picker: Picker },
-    ModelInput(InputBox),
-    Loading { kind: PickerKind, title: String },
-    Approval(ApprovalRequest),
+    Picker {
+        kind: PickerKind,
+        picker: Picker,
+    },
+    Loading {
+        kind: PickerKind,
+        title: String,
+    },
+    Approval {
+        request: ApprovalRequest,
+        selected: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalChoice {
+    Once,
+    Session,
+    Deny,
+}
+
+#[derive(Debug)]
+struct PendingReasoningSelection {
+    model: String,
+    effort_only: bool,
 }
 
 pub fn run(handle: RuntimeHandle) -> anyhow::Result<()> {
@@ -125,6 +151,10 @@ struct App {
     busy: bool,
     status_note: String,
     provider_label: String,
+    active_selection: ActiveModelSelection,
+    provider_catalog: Vec<ProviderCatalogEntry>,
+    reasoning_preferences: BTreeMap<String, BTreeMap<String, String>>,
+    pending_reasoning: Option<PendingReasoningSelection>,
     session_id: String,
     usage: Usage,
     scroll_up: usize,
@@ -140,6 +170,9 @@ struct App {
 impl App {
     fn new(handle: RuntimeHandle) -> App {
         let provider_label = handle.provider_label.clone();
+        let active_selection = handle.active_selection.clone();
+        let provider_catalog = handle.provider_catalog.clone();
+        let reasoning_preferences = handle.reasoning_preferences.clone();
         let session_id = handle.session_id.clone();
         App {
             handle,
@@ -155,6 +188,10 @@ impl App {
             busy: false,
             status_note: String::new(),
             provider_label,
+            active_selection,
+            provider_catalog,
+            reasoning_preferences,
+            pending_reasoning: None,
             session_id,
             usage: Usage::default(),
             scroll_up: 0,
@@ -247,13 +284,12 @@ impl App {
             }
             Event::Paste(s) => {
                 match &mut self.overlay {
-                    Some(Overlay::ModelInput(input)) => input.insert_str(&s),
                     Some(Overlay::Picker { picker, .. }) => {
                         for c in s.chars() {
                             picker.push_filter(c);
                         }
                     }
-                    Some(Overlay::Loading { .. }) | Some(Overlay::Approval(_)) => {}
+                    Some(Overlay::Loading { .. }) | Some(Overlay::Approval { .. }) => {}
                     None => {
                         self.input.insert_str(&s);
                         self.on_input_changed();
@@ -297,7 +333,10 @@ impl App {
             }
             AgentEvent::PermissionRequested { request } => {
                 self.status_note = format!("等待审批: {}", request.tool);
-                self.overlay = Some(Overlay::Approval(request));
+                self.overlay = Some(Overlay::Approval {
+                    request,
+                    selected: 0,
+                });
             }
             AgentEvent::PermissionResolved {
                 request_id,
@@ -305,7 +344,7 @@ impl App {
             } => {
                 if matches!(
                     &self.overlay,
-                    Some(Overlay::Approval(request)) if request.request_id == request_id
+                    Some(Overlay::Approval { request, .. }) if request.request_id == request_id
                 ) {
                     self.overlay = None;
                 }
@@ -338,8 +377,31 @@ impl App {
                 self.usage = Usage::default();
                 self.transcript.push_notice("会话已清空".into());
             }
-            AgentEvent::ProviderChanged { label } => {
+            AgentEvent::ModelSelectionChanged {
+                provider,
+                model,
+                effort,
+                label,
+            } => {
                 self.provider_label = label;
+                self.active_selection = ActiveModelSelection {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    effort: effort.clone(),
+                };
+                if effort == DEFAULT_REASONING_EFFORT {
+                    if let Some(models) = self.reasoning_preferences.get_mut(&provider) {
+                        models.remove(&model);
+                        if models.is_empty() {
+                            self.reasoning_preferences.remove(&provider);
+                        }
+                    }
+                } else {
+                    self.reasoning_preferences
+                        .entry(provider)
+                        .or_default()
+                        .insert(model, effort);
+                }
             }
             AgentEvent::SessionsListed {
                 current_id,
@@ -691,7 +753,7 @@ impl App {
     fn on_overlay_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let mut accept_picker = false;
         let mut close = false;
-        let mut approval = None;
+        let mut approval: Option<ApprovalResponse> = None;
         match self.overlay.as_mut().expect("overlay checked above") {
             Overlay::Picker { picker, .. } => match code {
                 KeyCode::Esc => close = true,
@@ -703,36 +765,6 @@ impl App {
                 KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => picker.push_filter(c),
                 _ => {}
             },
-            Overlay::ModelInput(input) => match code {
-                KeyCode::Esc => close = true,
-                KeyCode::Enter => {
-                    let model = input.take().trim().to_string();
-                    if !model.is_empty() {
-                        let _ = self.handle.commands.send(AgentCommand::SetModel(model));
-                        close = true;
-                    }
-                }
-                KeyCode::Backspace => input.backspace(),
-                KeyCode::Delete => input.delete(),
-                KeyCode::Left if mods.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
-                    input.move_word_left()
-                }
-                KeyCode::Right if mods.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) => {
-                    input.move_word_right()
-                }
-                KeyCode::Left => input.move_left(),
-                KeyCode::Right => input.move_right(),
-                KeyCode::Home => input.move_home(),
-                KeyCode::End => input.move_end(),
-                KeyCode::Char('a') if mods.contains(KeyModifiers::CONTROL) => input.move_start(),
-                KeyCode::Char('e') if mods.contains(KeyModifiers::CONTROL) => input.move_end_all(),
-                KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
-                    input.delete_word_left()
-                }
-                KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => input.clear(),
-                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => input.insert_char(c),
-                _ => {}
-            },
             Overlay::Loading { .. } => {
                 if matches!(code, KeyCode::Esc)
                     || matches!(code, KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL))
@@ -740,42 +772,62 @@ impl App {
                     close = true;
                 }
             }
-            Overlay::Approval(request) => match code {
-                KeyCode::Enter | KeyCode::Char('y')
-                    if request.scopes.contains(&ApprovalScope::Once) =>
-                {
-                    approval = Some((request.request_id.clone(), ApprovalScope::Once));
+            Overlay::Approval { request, selected } => match code {
+                KeyCode::Up | KeyCode::Left | KeyCode::BackTab => {
+                    let len = approval_choices(request).len();
+                    *selected = if *selected == 0 {
+                        len.saturating_sub(1)
+                    } else {
+                        *selected - 1
+                    };
+                }
+                KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                    let len = approval_choices(request).len();
+                    *selected = (*selected + 1) % len.max(1);
+                }
+                KeyCode::Enter => {
+                    if let Some(choice) = approval_choices(request).get(*selected).copied() {
+                        approval = Some(ApprovalResponse {
+                            request_id: request.request_id.clone(),
+                            decision: approval_decision(choice),
+                        });
+                    }
+                }
+                KeyCode::Char('y') if request.scopes.contains(&ApprovalScope::Once) => {
+                    approval = Some(ApprovalResponse {
+                        request_id: request.request_id.clone(),
+                        decision: ApprovalDecision::Allow(ApprovalScope::Once),
+                    });
                 }
                 KeyCode::Char('a') if request.scopes.contains(&ApprovalScope::Session) => {
-                    approval = Some((request.request_id.clone(), ApprovalScope::Session));
+                    approval = Some(ApprovalResponse {
+                        request_id: request.request_id.clone(),
+                        decision: ApprovalDecision::Allow(ApprovalScope::Session),
+                    });
                 }
                 KeyCode::Esc | KeyCode::Char('n') => {
-                    let _ = self.handle.approvals.send(ApprovalResponse {
+                    approval = Some(ApprovalResponse {
                         request_id: request.request_id.clone(),
                         decision: ApprovalDecision::Deny,
                     });
-                    close = true;
                 }
                 KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => {
-                    let _ = self.handle.approvals.send(ApprovalResponse {
+                    approval = Some(ApprovalResponse {
                         request_id: request.request_id.clone(),
                         decision: ApprovalDecision::Deny,
                     });
-                    close = true;
                 }
                 _ => {}
             },
         }
-        if let Some((request_id, scope)) = approval {
-            let _ = self.handle.approvals.send(ApprovalResponse {
-                request_id,
-                decision: ApprovalDecision::Allow(scope),
-            });
+        if let Some(response) = approval {
+            let _ = self.handle.approvals.send(response);
             self.overlay = None;
         } else if accept_picker {
             self.accept_picker();
         } else if close {
             self.overlay = None;
+            self.pending_reasoning = None;
         }
     }
 
@@ -794,11 +846,23 @@ impl App {
                 self.overlay = None;
             }
             (PickerKind::Model, Some(model)) => {
-                let _ = self.handle.commands.send(AgentCommand::SetModel(model));
-                self.overlay = None;
+                self.open_reasoning_picker(model, false);
             }
-            (PickerKind::Model, None) => {
-                self.overlay = Some(Overlay::ModelInput(InputBox::default()));
+            (PickerKind::Reasoning, Some(effort)) => {
+                let Some(pending) = self.pending_reasoning.take() else {
+                    self.overlay = None;
+                    return;
+                };
+                let command = if pending.effort_only {
+                    AgentCommand::SetReasoningEffort(effort)
+                } else {
+                    AgentCommand::SelectModel {
+                        model: pending.model,
+                        effort,
+                    }
+                };
+                let _ = self.handle.commands.send(command);
+                self.overlay = None;
             }
             (PickerKind::Session, Some(session_id)) => {
                 let _ = self
@@ -807,7 +871,13 @@ impl App {
                     .send(AgentCommand::LoadSession(session_id));
                 self.overlay = None;
             }
-            (PickerKind::Provider | PickerKind::Session, None) => {}
+            (
+                PickerKind::Provider
+                | PickerKind::Model
+                | PickerKind::Reasoning
+                | PickerKind::Session,
+                None,
+            ) => {}
         }
     }
 
@@ -963,30 +1033,32 @@ impl App {
                 if rest.is_empty() {
                     self.open_model_picker();
                 } else {
-                    let _ = self
-                        .handle
-                        .commands
-                        .send(AgentCommand::SetModel(rest.to_string()));
+                    self.select_model_from_args(rest);
+                }
+            }
+            command::SlashCommand::Reasoning => {
+                if rest.is_empty() {
+                    self.open_reasoning_picker(self.active_selection.model.clone(), true);
+                } else {
+                    self.set_reasoning_from_args(rest);
                 }
             }
         }
     }
 
     fn open_provider_picker(&mut self) {
-        let current = self.provider_label.split(" / ").next().unwrap_or("");
         let items = self
-            .handle
-            .provider_names
+            .provider_catalog
             .iter()
-            .map(|name| PickerItem {
-                label: name.clone(),
-                description: if name == current {
+            .map(|provider| PickerItem {
+                label: provider.name.clone(),
+                description: if provider.name == self.active_selection.provider {
                     "当前 provider".into()
                 } else {
                     "config.toml 中的 profile".into()
                 },
-                value: Some(name.clone()),
-                current: name == current,
+                value: Some(provider.name.clone()),
+                current: provider.name == self.active_selection.provider,
             })
             .collect();
         self.overlay = Some(Overlay::Picker {
@@ -996,34 +1068,150 @@ impl App {
     }
 
     fn open_model_picker(&mut self) {
-        let current = self.provider_label.split(" / ").nth(1).unwrap_or("");
-        let mut models = self.handle.model_names.clone();
-        if !current.is_empty() && !models.iter().any(|model| model == current) {
-            models.insert(0, current.to_string());
-        }
-        let mut items: Vec<PickerItem> = models
-            .into_iter()
+        let Some(provider) = self.current_provider() else {
+            self.transcript.push_error(format!(
+                "当前 provider {:?} 不在配置目录中",
+                self.active_selection.provider
+            ));
+            return;
+        };
+        let items = provider
+            .models
+            .iter()
             .map(|model| PickerItem {
-                description: if model == current {
+                description: if model.id == self.active_selection.model {
                     "当前模型".into()
                 } else {
                     "来自 config.toml".into()
                 },
-                current: model == current,
-                value: Some(model.clone()),
-                label: model,
+                current: model.id == self.active_selection.model,
+                value: Some(model.id.clone()),
+                label: model.id.clone(),
             })
             .collect();
-        items.push(PickerItem {
-            label: "自定义模型…".into(),
-            description: "输入服务端支持的模型名称".into(),
-            value: None,
-            current: false,
-        });
         self.overlay = Some(Overlay::Picker {
             kind: PickerKind::Model,
             picker: Picker::new("选择模型", items),
         });
+    }
+
+    fn open_reasoning_picker(&mut self, model_id: String, effort_only: bool) {
+        let Some(model) = self.current_model(&model_id).cloned() else {
+            self.transcript.push_error(format!(
+                "provider {:?} 没有模型 {:?}",
+                self.active_selection.provider, model_id
+            ));
+            return;
+        };
+        let selected_effort = if model_id == self.active_selection.model {
+            self.active_selection.effort.clone()
+        } else {
+            self.saved_effort(&model_id)
+                .filter(|saved| model.efforts.iter().any(|effort| effort == saved))
+                .unwrap_or(DEFAULT_REASONING_EFFORT)
+                .to_string()
+        };
+        let items = model
+            .efforts
+            .iter()
+            .map(|effort| PickerItem {
+                label: effort.clone(),
+                description: if model.sends_effort {
+                    "发送给 provider".into()
+                } else {
+                    "默认程度，不发送 effort 字段".into()
+                },
+                value: Some(effort.clone()),
+                current: effort == &selected_effort,
+            })
+            .collect();
+        self.pending_reasoning = Some(PendingReasoningSelection {
+            model: model_id.clone(),
+            effort_only,
+        });
+        self.overlay = Some(Overlay::Picker {
+            kind: PickerKind::Reasoning,
+            picker: Picker::new(format!("选择 {} 的思考程度", model_id), items),
+        });
+    }
+
+    fn select_model_from_args(&mut self, rest: &str) {
+        let mut args = rest.split_whitespace();
+        let model = args.next().unwrap_or_default();
+        let effort = args.next();
+        if args.next().is_some() {
+            self.transcript
+                .push_error("用法: /model <模型> [思考程度]".into());
+            return;
+        }
+        let Some(entry) = self.current_model(model) else {
+            self.transcript.push_error(format!(
+                "provider {:?} 没有模型 {:?}",
+                self.active_selection.provider, model
+            ));
+            return;
+        };
+        match effort {
+            None => self.open_reasoning_picker(model.to_string(), false),
+            Some(effort) if entry.efforts.iter().any(|item| item == effort) => {
+                let _ = self.handle.commands.send(AgentCommand::SelectModel {
+                    model: model.to_string(),
+                    effort: effort.to_string(),
+                });
+            }
+            Some(effort) => self.transcript.push_error(format!(
+                "模型 {:?} 不支持思考程度 {:?}，可选: {}",
+                model,
+                effort,
+                entry.efforts.join(", ")
+            )),
+        }
+    }
+
+    fn set_reasoning_from_args(&mut self, rest: &str) {
+        let args = rest.split_whitespace().collect::<Vec<_>>();
+        if args.len() != 1 {
+            self.transcript
+                .push_error("用法: /reasoning <思考程度>".into());
+            return;
+        }
+        let effort = args[0];
+        let Some(model) = self.current_model(&self.active_selection.model) else {
+            self.transcript.push_error("当前模型不在配置目录中".into());
+            return;
+        };
+        if !model.efforts.iter().any(|item| item == effort) {
+            self.transcript.push_error(format!(
+                "当前模型不支持思考程度 {:?}，可选: {}",
+                effort,
+                model.efforts.join(", ")
+            ));
+            return;
+        }
+        let _ = self
+            .handle
+            .commands
+            .send(AgentCommand::SetReasoningEffort(effort.to_string()));
+    }
+
+    fn current_provider(&self) -> Option<&ProviderCatalogEntry> {
+        self.provider_catalog
+            .iter()
+            .find(|provider| provider.name == self.active_selection.provider)
+    }
+
+    fn current_model(&self, model: &str) -> Option<&ModelCatalogEntry> {
+        self.current_provider()?
+            .models
+            .iter()
+            .find(|entry| entry.id == model)
+    }
+
+    fn saved_effort(&self, model: &str) -> Option<&str> {
+        self.reasoning_preferences
+            .get(&self.active_selection.provider)
+            .and_then(|models| models.get(model))
+            .map(String::as_str)
     }
 
     // ---- 输入历史 ----
@@ -1068,8 +1256,8 @@ impl App {
         if self.overlay.is_some() {
             let bottom_h = match &self.overlay {
                 Some(Overlay::Picker { picker, .. }) => picker.preferred_height(),
-                Some(Overlay::ModelInput(_)) | Some(Overlay::Loading { .. }) => 5,
-                Some(Overlay::Approval(_)) => 7,
+                Some(Overlay::Loading { .. }) => 5,
+                Some(Overlay::Approval { .. }) => 8,
                 None => 0,
             }
             .min(area.height.saturating_sub(2));
@@ -1078,11 +1266,10 @@ impl App {
             self.draw_transcript(frame, t_area);
             match &mut self.overlay {
                 Some(Overlay::Picker { picker, .. }) => picker.render(frame, overlay_area),
-                Some(Overlay::ModelInput(input)) => {
-                    draw_model_input(frame, overlay_area, input);
-                }
                 Some(Overlay::Loading { title, .. }) => draw_loading(frame, overlay_area, title),
-                Some(Overlay::Approval(request)) => draw_approval(frame, overlay_area, request),
+                Some(Overlay::Approval { request, selected }) => {
+                    draw_approval(frame, overlay_area, request, *selected)
+                }
                 None => {}
             }
             return;
@@ -1280,48 +1467,6 @@ fn clear_wide_continuation_cells(buffer: &mut ratatui::buffer::Buffer) {
     }
 }
 
-fn draw_model_input(frame: &mut Frame, area: Rect, input: &InputBox) {
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            " 自定义模型 ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let [label_area, input_area, hint_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
-    frame.render_widget(Paragraph::new("  输入服务端支持的模型名称"), label_area);
-    let view = input.view(input_area.width.saturating_sub(4), 1);
-    let value = view.rows.first().cloned().unwrap_or_default();
-    let line = if value.is_empty() {
-        Line::from(vec![
-            Span::styled("› ", Style::default().fg(Color::Cyan)),
-            Span::styled("例如 gpt-5", Style::default().fg(Color::DarkGray)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("› ", Style::default().fg(Color::Cyan)),
-            Span::raw(value),
-        ])
-    };
-    frame.render_widget(Paragraph::new(line), input_area);
-    frame.render_widget(
-        Paragraph::new("  Enter 确认  Esc 返回").style(Style::default().fg(Color::DarkGray)),
-        hint_area,
-    );
-    frame.set_cursor_position((
-        input_area.x + 2 + view.cursor_col.min(input_area.width.saturating_sub(3)),
-        input_area.y,
-    ));
-}
-
 fn draw_loading(frame: &mut Frame, area: Rect, title: &str) {
     frame.render_widget(Clear, area);
     let block = Block::default()
@@ -1338,7 +1483,27 @@ fn draw_loading(frame: &mut Frame, area: Rect, title: &str) {
     );
 }
 
-fn draw_approval(frame: &mut Frame, area: Rect, request: &ApprovalRequest) {
+fn approval_choices(request: &ApprovalRequest) -> Vec<ApprovalChoice> {
+    let mut choices = Vec::with_capacity(3);
+    if request.scopes.contains(&ApprovalScope::Once) {
+        choices.push(ApprovalChoice::Once);
+    }
+    if request.scopes.contains(&ApprovalScope::Session) {
+        choices.push(ApprovalChoice::Session);
+    }
+    choices.push(ApprovalChoice::Deny);
+    choices
+}
+
+fn approval_decision(choice: ApprovalChoice) -> ApprovalDecision {
+    match choice {
+        ApprovalChoice::Once => ApprovalDecision::Allow(ApprovalScope::Once),
+        ApprovalChoice::Session => ApprovalDecision::Allow(ApprovalScope::Session),
+        ApprovalChoice::Deny => ApprovalDecision::Deny,
+    }
+}
+
+fn draw_approval(frame: &mut Frame, area: Rect, request: &ApprovalRequest, selected: usize) {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::TOP)
@@ -1351,6 +1516,27 @@ fn draw_approval(frame: &mut Frame, area: Rect, request: &ApprovalRequest) {
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let mut options = vec![Span::raw("  ")];
+    for (index, choice) in approval_choices(request).iter().enumerate() {
+        let label = match choice {
+            ApprovalChoice::Once => "允许一次",
+            ApprovalChoice::Session => "本会话允许",
+            ApprovalChoice::Deny => "拒绝",
+        };
+        let style = if index == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if *choice == ApprovalChoice::Deny {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default()
+        };
+        options.push(Span::styled(
+            format!("{} {}  ", if index == selected { "›" } else { " " }, label),
+            style,
+        ));
+    }
     let text = vec![
         Line::from(vec![
             Span::styled("  工具  ", Style::default().fg(Color::DarkGray)),
@@ -1364,8 +1550,9 @@ fn draw_approval(frame: &mut Frame, area: Rect, request: &ApprovalRequest) {
             Span::styled("  原因  ", Style::default().fg(Color::DarkGray)),
             Span::raw(request.reason.clone()),
         ]),
+        Line::from(options),
         Line::from(Span::styled(
-            "  Enter/Y 本次允许   A 本会话相同调用   N/Esc 拒绝",
+            "  ←→/↑↓ 选择  Enter 确认  Esc 拒绝",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -1400,9 +1587,49 @@ mod tests {
             approvals: approval_tx,
             events: evt_rx,
             cancel: Arc::new(AtomicBool::new(false)),
-            provider_label: "mock / test-model".into(),
-            provider_names: vec!["mock".into()],
-            model_names: vec!["test-model".into(), "other-model".into()],
+            provider_label: "mock / test-model / effort=medium".into(),
+            active_selection: ActiveModelSelection {
+                provider: "mock".into(),
+                model: "test-model".into(),
+                effort: "medium".into(),
+            },
+            provider_catalog: vec![
+                ProviderCatalogEntry {
+                    name: "mock".into(),
+                    default_model: "test-model".into(),
+                    models: vec![
+                        ModelCatalogEntry {
+                            id: "test-model".into(),
+                            context_window: Some(100_000),
+                            max_tokens: Some(8_000),
+                            efforts: vec!["low".into(), "medium".into(), "high".into()],
+                            sends_effort: true,
+                        },
+                        ModelCatalogEntry {
+                            id: "other-model".into(),
+                            context_window: Some(50_000),
+                            max_tokens: Some(4_000),
+                            efforts: vec!["medium".into(), "high".into()],
+                            sends_effort: true,
+                        },
+                    ],
+                },
+                ProviderCatalogEntry {
+                    name: "other-provider".into(),
+                    default_model: "foreign-model".into(),
+                    models: vec![ModelCatalogEntry {
+                        id: "foreign-model".into(),
+                        context_window: Some(32_000),
+                        max_tokens: None,
+                        efforts: vec!["medium".into()],
+                        sends_effort: false,
+                    }],
+                },
+            ],
+            reasoning_preferences: BTreeMap::from([(
+                "mock".into(),
+                BTreeMap::from([("other-model".into(), "high".into())]),
+            )]),
             session_id: "12345678-1234-1234-1234-123456789abc".into(),
         };
         (App::new(handle), evt_tx, cmd_rx, approval_rx)
@@ -1619,21 +1846,39 @@ mod tests {
     }
 
     #[test]
-    fn model_picker_supports_custom_model_input() {
+    fn model_picker_filters_provider_and_selects_effort_before_sending() {
         let (mut app, _evt, cmd, _approvals) = dummy_app();
         app.handle_slash("model");
-        // 从当前 test-model 越过另一个已配置模型，移动到“自定义模型”。
-        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        let Some(Overlay::Picker { kind, picker }) = &app.overlay else {
+            panic!("应打开模型选择器");
+        };
+        assert_eq!(*kind, PickerKind::Model);
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["test-model", "other-model"]
+        );
+
         app.on_key(KeyCode::Down, KeyModifiers::NONE);
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(matches!(app.overlay, Some(Overlay::ModelInput(_))));
-        for c in "new-model".chars() {
-            app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
-        }
+        assert!(cmd.try_recv().is_err(), "选择模型时不应提前提交");
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Picker {
+                kind: PickerKind::Reasoning,
+                ..
+            })
+        ));
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
         match cmd.try_recv() {
-            Ok(AgentCommand::SetModel(model)) => assert_eq!(model, "new-model"),
-            other => panic!("应收到 SetModel,得到 {:?}", other),
+            Ok(AgentCommand::SelectModel { model, effort }) => {
+                assert_eq!(model, "other-model");
+                assert_eq!(effort, "high");
+            }
+            other => panic!("应收到原子 SelectModel,得到 {:?}", other),
         }
     }
 
@@ -1649,13 +1894,20 @@ mod tests {
                 scopes: vec![ApprovalScope::Once, ApprovalScope::Session],
             },
         });
-        assert!(matches!(app.overlay, Some(Overlay::Approval(_))));
+        assert!(matches!(app.overlay, Some(Overlay::Approval { .. })));
+        let mut term = Terminal::new(TestBackend::new(72, 18)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+        let content = format!("{:?}", term.backend().buffer());
+        assert!(content.contains("允许一次"));
+        assert!(content.contains("本会话允许"));
+        assert!(content.contains("拒绝"));
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
             approvals.recv().unwrap(),
             ApprovalResponse {
                 request_id: "approval-once".into(),
-                decision: ApprovalDecision::Allow(ApprovalScope::Once),
+                decision: ApprovalDecision::Allow(ApprovalScope::Session),
             }
         );
         assert!(app.overlay.is_none());
@@ -1669,7 +1921,8 @@ mod tests {
                 scopes: vec![ApprovalScope::Once],
             },
         });
-        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.on_key(KeyCode::Right, KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
             approvals.recv().unwrap(),
             ApprovalResponse {
@@ -1692,7 +1945,9 @@ mod tests {
         term.draw(|f| app.draw(f)).unwrap();
         let content = format!("{:?}", term.backend().buffer());
         assert!(content.contains("选择模型"));
-        assert!(content.contains("自定义模型"));
+        assert!(content.contains("test-model"));
+        assert!(content.contains("other-model"));
+        assert!(!content.contains("foreign-model"));
     }
 
     #[test]

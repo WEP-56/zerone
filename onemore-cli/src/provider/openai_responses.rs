@@ -30,9 +30,9 @@ use serde_json::{json, Value};
 
 use super::{
     args_to_string, http_agent, parse_args, post_sse, sse::SseReader, FailedTurn, Provider,
-    ProviderError, ProviderEvent, StreamTerminal, TurnOutput,
+    ProviderError, ProviderEvent, ReasoningEffortFormat, StreamTerminal, TurnOutput,
 };
-use crate::config::ProviderSettings;
+use crate::config::{ProviderSettings, ReasoningEffortPolicy};
 use crate::context::PromptContext;
 use crate::message::{Block, CacheUsage, ChatMessage, Role, StopReason, Usage};
 use crate::tools::ToolSpec;
@@ -135,6 +135,11 @@ impl ResponsesProvider {
             body["store"] = json!(false);
             // 拿到加密的 reasoning 内容,才能在下一轮原样回传。
             body["include"] = json!(["reasoning.encrypted_content"]);
+        }
+        if capabilities.reasoning_effort_format == ReasoningEffortFormat::OpenAiResponses {
+            if let ReasoningEffortPolicy::Send(effort) = &self.settings.reasoning_effort {
+                body["reasoning"] = json!({"effort": effort});
+            }
         }
         let system = prompt.system_text();
         if !system.is_empty() {
@@ -254,15 +259,14 @@ fn cache_usage(usage: &Value) -> Option<CacheUsage> {
 
 impl Provider for ResponsesProvider {
     fn label(&self) -> String {
-        format!("{} / {}", self.settings.name, self.settings.model)
+        format!(
+            "{} / {} / effort={}",
+            self.settings.name, self.settings.model, self.settings.selected_effort
+        )
     }
 
     fn model(&self) -> &str {
         &self.settings.model
-    }
-
-    fn set_model(&mut self, model: String) {
-        self.settings.model = model;
     }
 
     fn stream_turn(
@@ -294,8 +298,13 @@ impl ResponsesProvider {
             headers.push(("authorization", format!("Bearer {}", self.settings.api_key)));
         }
         let body = self.build_body(prompt, tools);
-        let prompt_fingerprint =
-            super::prompt_fingerprint(self.settings.profile, &self.settings.model, prompt, tools);
+        let prompt_fingerprint = super::prompt_fingerprint(
+            self.settings.profile,
+            &self.settings.model,
+            &self.settings.reasoning_effort,
+            prompt,
+            tools,
+        );
         let reader = post_sse(&self.agent, &url, &headers, &body)?;
         let mut sse = SseReader::new(reader);
 
@@ -487,6 +496,8 @@ mod tests {
             model: "gpt-5".into(),
             max_tokens: None,
             context_window: None,
+            selected_effort: "medium".into(),
+            reasoning_effort: ReasoningEffortPolicy::Omit,
         })
     }
 
@@ -561,6 +572,27 @@ mod tests {
         });
         let body = provider().build_body(&prompt, &[]);
         assert!(body["input"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn effort_is_encoded_without_changing_the_stable_cache_key() {
+        let prompt = PromptContext::default();
+        let omitted = provider().build_body(&prompt, &[]);
+        assert!(omitted.get("reasoning").is_none());
+
+        let mut high_settings = provider().settings;
+        high_settings.selected_effort = "high".into();
+        high_settings.reasoning_effort = ReasoningEffortPolicy::Send("high".into());
+        let high = ResponsesProvider::new(high_settings).build_body(&prompt, &[]);
+        assert_eq!(high["reasoning"]["effort"], "high");
+        assert_eq!(high["prompt_cache_key"], omitted["prompt_cache_key"]);
+
+        let mut none_settings = provider().settings;
+        none_settings.selected_effort = "none".into();
+        none_settings.reasoning_effort = ReasoningEffortPolicy::Send("none".into());
+        let none = ResponsesProvider::new(none_settings).build_body(&prompt, &[]);
+        assert_eq!(none["reasoning"]["effort"], "none");
+        assert_eq!(none["prompt_cache_key"], omitted["prompt_cache_key"]);
     }
 
     #[test]

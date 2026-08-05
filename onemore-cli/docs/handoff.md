@@ -2,9 +2,15 @@
 
 ## Purpose
 
-The next session should research mature coding-agent implementations before adding advanced features to Onemore. Do not begin implementation until the research produces a concrete comparison and a staged design recommendation.
+The open-source coding-agent research pass is complete. Its primary result and source of truth is:
 
-Research order:
+```text
+E:\harness from scratch\onemore-cli\docs\open-source-agent-research.md
+```
+
+Read that document before designing advanced features. It contains the evidence-backed comparison, invariants, failure cases, proposed Onemore types/events/facts/tests, cache implications, and staged delivery recommendation. Do not re-run the broad Grok Build/Codex survey unless a specific claim needs revalidation against a newer upstream snapshot.
+
+Recommended implementation order from the research:
 
 1. `todo_write` / `update_plan` and long-running task discipline;
 2. Skills and MCP integration;
@@ -14,7 +20,7 @@ Research order:
 
 Repository: `E:\harness from scratch\onemore-cli`
 
-Current version: `0.2.0`
+Current version: `0.3.0`
 
 Implemented foundations:
 
@@ -217,9 +223,9 @@ Questions:
 - How are child results returned without importing the entire child transcript?
 - How are token usage, maximum depth, maximum children, and failure propagation bounded?
 
-## Research Deliverable
+## Completed Research Deliverable
 
-Create `onemore-cli/docs/open-source-agent-research.md` with:
+The completed result is `onemore-cli/docs/open-source-agent-research.md`. It includes:
 
 1. a compact architecture map for each reference project;
 2. a behavior and data-model comparison for Todo, Skills, MCP, and Subagents;
@@ -229,12 +235,13 @@ Create `onemore-cli/docs/open-source-agent-research.md` with:
 6. proposed types, Session Facts, Agent events, tool contracts, and tests;
 7. cache implications for every feature that changes instructions or tool schemas.
 
-The deliverable should lead with evidence and local file references. It should not modify Onemore implementation code in the same research pass.
+Treat this document as the baseline for follow-up design. The research pass itself did not copy upstream implementation code; any later direct reuse still requires dependency and license review.
 
 ## Recommended First Commands
 
 ```powershell
 Get-Content "E:\harness from scratch\onemore-cli\docs\handoff.md"
+Get-Content "E:\harness from scratch\onemore-cli\docs\open-source-agent-research.md"
 rg -n "todo_write|update_plan" "E:\harness from scratch\example\grok-build\crates" "E:\harness from scratch\example\codex\codex-rs"
 rg -n "skill|MCP|spawn_agent|subagent" "E:\harness from scratch\example\grok-build\crates" "E:\harness from scratch\example\codex\codex-rs\core\src"
 ```

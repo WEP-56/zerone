@@ -118,8 +118,13 @@ pub struct ProviderCapabilities {
     pub input_files: bool,
     pub server_web_search: bool,
     pub parallel_tool_calls_control: bool,
+    pub reasoning_effort_format: ReasoningEffortFormat,
 }
 ```
+
+`ReasoningEffortFormat` 是编码器选择，而不是简单的支持/不支持 bool：OpenAI
+Responses 使用 `reasoning.effort`；Anthropic Messages 使用 adaptive `thinking` 与
+`output_config.effort`。DeepSeek Profile 在有对应请求 Fixture 前保持不支持。
 
 具体表示形式未来可以演进，但每项功能都必须明确声明默认值为“不支持”。
 

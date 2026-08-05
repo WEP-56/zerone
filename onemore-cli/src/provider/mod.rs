@@ -30,7 +30,7 @@ use std::time::Duration;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::{ApiKind, ProviderProfile, ProviderSettings};
+use crate::config::{ApiKind, ProviderProfile, ProviderSettings, ReasoningEffortPolicy};
 use crate::context::PromptContext;
 use crate::message::{ChatMessage, StopReason, Usage};
 use crate::tools::ToolSpec;
@@ -43,6 +43,15 @@ pub struct ProviderCapabilities {
     pub prompt_cache_key: bool,
     pub explicit_cache_control: bool,
     pub canonical_version_header: bool,
+    pub reasoning_effort_format: ReasoningEffortFormat,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReasoningEffortFormat {
+    #[default]
+    Unsupported,
+    OpenAiResponses,
+    AnthropicAdaptive,
 }
 
 impl ProviderProfile {
@@ -52,12 +61,14 @@ impl ProviderProfile {
                 encrypted_reasoning_replay: true,
                 reasoning_summary_stream: true,
                 prompt_cache_key: true,
+                reasoning_effort_format: ReasoningEffortFormat::OpenAiResponses,
                 ..ProviderCapabilities::default()
             },
             ProviderProfile::AnthropicMessages => ProviderCapabilities {
                 reasoning_text_stream: true,
                 explicit_cache_control: true,
                 canonical_version_header: true,
+                reasoning_effort_format: ReasoningEffortFormat::AnthropicAdaptive,
                 ..ProviderCapabilities::default()
             },
             ProviderProfile::DeepSeekResponses => ProviderCapabilities {
@@ -121,7 +132,6 @@ pub trait Provider: Send {
     /// 状态栏显示用,如 `anthropic / claude-sonnet-5`。
     fn label(&self) -> String;
     fn model(&self) -> &str;
-    fn set_model(&mut self, model: String);
 
     /// Provider 的唯一公共调用边界：每次调用必然终止于 Done、Error 或 Aborted。
     fn stream_turn(
@@ -205,13 +215,15 @@ fn sha256_hex(value: &Value) -> String {
 pub(crate) fn prompt_fingerprint(
     profile: ProviderProfile,
     model: &str,
+    reasoning_effort: &ReasoningEffortPolicy,
     prompt: &PromptContext,
     tools: &[ToolSpec],
 ) -> String {
     let semantic_prompt = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "profile": profile_id(profile),
         "model": model,
+        "reasoning_effort": reasoning_effort,
         "system": prompt.system_text(),
         "tools": canonical_tools(tools),
         "messages": prompt.messages,
@@ -470,13 +482,21 @@ mod tests {
         let tools = vec![tool("zeta"), tool("alpha")];
         let reversed = vec![tool("alpha"), tool("zeta")];
 
-        let first_fingerprint =
-            prompt_fingerprint(ProviderProfile::OpenAiResponses, "gpt-test", &first, &tools);
+        let medium = ReasoningEffortPolicy::Send("medium".into());
+        let high = ReasoningEffortPolicy::Send("high".into());
+        let first_fingerprint = prompt_fingerprint(
+            ProviderProfile::OpenAiResponses,
+            "gpt-test",
+            &medium,
+            &first,
+            &tools,
+        );
         assert_eq!(
             first_fingerprint,
             prompt_fingerprint(
                 ProviderProfile::OpenAiResponses,
                 "gpt-test",
+                &medium,
                 &first,
                 &reversed,
             )
@@ -486,7 +506,18 @@ mod tests {
             prompt_fingerprint(
                 ProviderProfile::OpenAiResponses,
                 "gpt-test",
+                &medium,
                 &second,
+                &tools,
+            )
+        );
+        assert_ne!(
+            first_fingerprint,
+            prompt_fingerprint(
+                ProviderProfile::OpenAiResponses,
+                "gpt-test",
+                &high,
+                &first,
                 &tools,
             )
         );

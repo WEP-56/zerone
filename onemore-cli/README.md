@@ -39,7 +39,9 @@ TUI 内常用操作:
 | `/compact` | 调模型生成摘要作为 Compaction 事实;模型视图缩小,事实日志不减少 |
 | `Esc` | 取消当前轮(丢弃半截流式输出;未执行的工具调用补取消结果;清空排队输入) |
 | `/session [ID]` | 列出/恢复会话,恢复时重建全部事实(含 UI-only 提示) |
-| `/provider` `/model` | 热切换,写入 ModelChange 事实,历史保留 |
+| `/provider` | 只切换 provider，使用其默认模型，历史保留 |
+| `/model` | 只列出当前 provider 的模型；选模型后再确认思考程度 |
+| `/reasoning` (`/effort`) | 调整当前模型的思考程度 |
 
 ## 与 Zerone 的区别
 
@@ -142,8 +144,19 @@ commands = "ask"
 
 [providers.xxx]
 profile = "openai"             # openai | anthropic | deepseek-responses | deepseek-messages
-context_window = 200000        # 可选:配置后启用上下文预算与 /compact 提示
+default_model = "gpt-5"
+
+[providers.xxx.models."gpt-5"]
+context_window = 400000        # 每个模型独立配置上下文窗口
+max_tokens = 128000
+
+[providers.xxx.models."gpt-5".reasoning]
+send_effort = true             # false 或省略此 table 时不发送 effort 字段
+efforts = ["none", "low", "medium", "high"]
 ```
+
+思考程度默认始终为 `medium`。非 `medium` 选择按 workspace/provider/model 保存；
+新 workspace、新模型以及切回默认值时都使用 `medium`。
 
 ## 存储
 
@@ -152,6 +165,8 @@ context_window = 200000        # 可选:配置后启用上下文预算与 /compa
   config.toml
   sessions/
     <session-id>.db            # schema v3:事实日志 + token/cache 累计用量
+  workspaces/
+    <workspace-hash>.json      # 仅保存偏离 medium 的模型思考程度
 ```
 
 Onemore 不读取 `~/.zerone`,也不识别 `ZERONE_HOME`,因此两个程序的配置、密钥和会话
@@ -164,7 +179,7 @@ messages 表)数据库在打开时自动迁移到当前 schema,迁移失败回�
 
 ```powershell
 .\scripts\package-npm.ps1 -Pack
-npm install --global .\dist\npm\onemore-agent-0.2.0.tgz
+npm install --global .\dist\npm\onemore-agent-0.3.0.tgz
 onemore --help
 ```
 

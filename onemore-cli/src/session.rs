@@ -115,6 +115,12 @@ pub struct CompactionRecord {
 pub struct ModelChangeRecord {
     pub provider: String,
     pub model: String,
+    #[serde(default = "default_reasoning_effort")]
+    pub effort: String,
+}
+
+fn default_reasoning_effort() -> String {
+    crate::config::DEFAULT_REASONING_EFFORT.to_string()
 }
 
 #[derive(Debug, Clone)]

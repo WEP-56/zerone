@@ -1,10 +1,10 @@
 # Reasoning Effort、多模型配置与 TUI 选择设计
 
-> 状态：首要实现设计
+> 状态：已实现（2026-08-05）
 >
 > 范围：`config.toml`、Responses/Messages 请求编码、Runtime 模型选择状态、Session Fact、TUI `/provider`、`/model` 与 reasoning 选择。
 >
-> 本文只定义设计，不在同一研究阶段修改实现代码。引用路径相对于工作区根目录 `E:\harness from scratch`。
+> 本文记录 Pi 源码研究、最终语义与实现约束。引用路径相对于工作区根目录 `E:\harness from scratch`。
 
 ## 决策摘要
 
@@ -13,24 +13,20 @@ Onemore 应支持一个 Provider 配置多个模型，并让每个模型独立�
 - `context_window`；
 - `max_tokens`；
 - 是否发送 reasoning effort 控制字段；
-- 可选的厂商原始 effort 名称；
-- 默认 effort。
+- 可选的厂商原始 effort 名称。
 
-Reasoning effort 必须是三态，而不是一个 bool：
+运行时请求策略不是一个 bool：
 
 ```rust
 pub enum ReasoningEffortPolicy {
-    Default,       // 没有模型级配置，保持 Provider 当前行为
-    Omit,          // 明确不发送 effort 控制字段
+    Omit,          // 不发送 effort 控制字段
     Send(String),  // 原样发送厂商 effort 值，包括 "none"
 }
 ```
 
-三个状态不能合并：
+没有 reasoning 配置与 `send_effort=false` 都解析为 `Omit`，保持原有请求行为。`Send("none")` 则明确把字符串 `none` 发给远端，与省略字段语义不同。
 
-- `Default` 表示“不覆盖”；未来 Provider Profile 的默认行为可以演进。
-- `Omit` 表示用户明确要求省略字段，不能偷偷改写成 `none` 或 `disabled`。
-- `Send("none")` 表示明确把字符串 `none` 发给远端，与省略字段语义不同。
+所有 workspace、Provider 和模型的初始思考程度固定为 `medium`。用户选择非 `medium` 后，覆盖值按 `workspace + provider + model` 保存；切回 `medium` 删除覆盖。配置不允许改变这个默认值。
 
 TUI 使用两阶段选择：
 
@@ -42,14 +38,12 @@ TUI 使用两阶段选择：
 
 /provider
   -> Provider
-  -> 该 Provider 的模型
-  -> 该模型的思考程度
-  -> 一次性提交完整选择
+  -> 切换到该 Provider 的 default_model
 ```
 
-单独更改当前模型的思考程度使用 `/reasoning`，可提供 `/effort` 别名。`/provider` 不应被改成“只切换思考程度”，因为它已经稳定表示 Provider 切换；本文把需求中的“`/provider` 用于切换思考程度”解释为：**Provider 切换流程必须继续完成模型和思考程度选择**。若确实要复用 `/provider` 命令本身切 effort，需要另行确认并接受破坏现有语义。
+单独更改当前模型的思考程度使用 `/reasoning`，并提供 `/effort` 别名。`/provider` 只负责切换 Provider；目标 Provider 使用自己的 `default_model`，以及该 workspace 为该默认模型保存的 effort（没有保存值时为 `medium`）。
 
-## 当前缺口
+## 改造前缺口
 
 ### 配置只能表达单 Provider 单模型
 
@@ -183,7 +177,6 @@ max_tokens = 128000
 [providers.openai.models."gpt-5".reasoning]
 send_effort = true
 efforts = ["none", "minimal", "low", "medium", "high"]
-default_effort = "medium"
 
 [providers.openai.models."gpt-5-pro"]
 context_window = 400000
@@ -192,7 +185,6 @@ max_tokens = 128000
 [providers.openai.models."gpt-5-pro".reasoning]
 send_effort = true
 efforts = ["low", "medium", "high", "xhigh"]
-default_effort = "high"
 
 # 这个模型明确禁止 Onemore 发送 effort 控制字段。
 [providers.openai.models."proxy-owned-model"]
@@ -220,9 +212,8 @@ max_tokens = 32000
 [providers.anthropic.models."claude-opus-4-7".reasoning]
 send_effort = true
 efforts = ["low", "medium", "high", "xhigh"]
-default_effort = "high"
 
-# 没有 reasoning table：保持该 Provider Profile 的当前默认行为。
+# 没有 reasoning table：TUI 显示 medium，请求不发送 effort 字段。
 [providers.anthropic.models."claude-sonnet-4"]
 context_window = 200000
 max_tokens = 16000
@@ -234,20 +225,19 @@ max_tokens = 16000
 
 | 配置 | 解析结果 | TUI 候选 | 请求行为 |
 |---|---|---|---|
-| 没有 `reasoning` table | `Default` | `默认` | 保持 adapter 既有行为，不新增字段 |
-| `send_effort=false` | `Omit` | `不发送 effort` | 明确删除/不创建 effort 控制字段 |
-| `send_effort=true` | `Send(default_effort)` | `efforts` 中每个原始值 | 按 Profile 格式发送选中值 |
+| 没有 `reasoning` table | `Omit` | `medium` | 保持 adapter 既有行为，不新增字段 |
+| `send_effort=false` | `Omit` | `medium` | 明确不创建 effort 控制字段 |
+| `send_effort=true` | `Send("medium")` | `efforts` 中每个原始值 | 默认发送 `medium`，选择后发送对应原始值 |
 | `send_effort=true` 且 TUI 选中 `none` | `Send("none")` | `none` | 明确发送字符串 `none`，不是省略 |
 
 配置校验：
 
 1. `default_model` 必须存在于 `models`。
 2. `context_window` 和 `max_tokens` 必须大于 0，且 `max_tokens <= context_window`。
-3. `send_effort=true` 时，`efforts` 必须非空、无重复、每项 trim 后非空且不超过 64 字符。
-4. `default_effort` 必须存在于 `efforts`。
-5. `send_effort=false` 时不得同时配置 `efforts/default_effort`，避免看似生效但被忽略。
-6. `send_effort=true` 但 Provider Profile 没有 effort encoder 时，启动直接报配置错误，不能把字段发到猜测位置。
-7. Provider/model 目录按 TOML 的逻辑 ID 查找；显示顺序使用显式 `order` 或稳定字典序，不能依赖 HashMap。
+3. `send_effort=true` 时，`efforts` 必须非空、无重复、每项 trim 后非空且不超过 64 字符，并必须包含 `medium`。
+4. `send_effort=false` 时不得同时配置 `efforts`，避免看似生效但被忽略。
+5. `send_effort=true` 但 Provider Profile 没有 effort encoder 时，启动直接报配置错误，不能把字段发到猜测位置。
+6. Provider/model 目录按 TOML 的逻辑 ID 查找；当前实现使用 `BTreeMap` 的稳定字典序。
 
 ### 兼容旧配置
 
@@ -266,7 +256,7 @@ context_window = 400000
 default_model = model
 models[model].max_tokens = provider.max_tokens
 models[model].context_window = provider.context_window
-models[model].reasoning = absent -> Default
+models[model].reasoning = absent -> Omit（UI effort 仍为 medium）
 ```
 
 同一个 Provider 不能同时使用旧 `model` 字段和新 `default_model/models`，混用应报错。`config.example.toml` 和首次启动模板只展示新格式。
@@ -307,7 +297,6 @@ struct ReasoningSection {
     send_effort: bool,
     #[serde(default)]
     efforts: Vec<String>,
-    default_effort: Option<String>,
 }
 ```
 
@@ -324,24 +313,16 @@ pub struct ProviderCatalogEntry {
 
 pub struct ModelCatalogEntry {
     pub id: String,
-    pub context_window: u64,
+    pub context_window: Option<u64>,
     pub max_tokens: Option<u64>,
-    pub reasoning: ReasoningCatalog,
-}
-
-pub enum ReasoningCatalog {
-    Default,
-    Omit,
-    Selectable {
-        efforts: Vec<String>,
-        default_effort: String,
-    },
+    pub efforts: Vec<String>,
+    pub sends_effort: bool,
 }
 
 pub struct ActiveModelSelection {
     pub provider: String,
     pub model: String,
-    pub reasoning: ReasoningEffortPolicy,
+    pub effort: String,
 }
 ```
 
@@ -382,7 +363,6 @@ pub struct ProviderCapabilities {
 
 ```rust
 match &settings.reasoning {
-    ReasoningEffortPolicy::Default => {}
     ReasoningEffortPolicy::Omit => {
         // Do not create body["reasoning"] for effort control.
     }
@@ -398,7 +378,6 @@ match &settings.reasoning {
 
 ```rust
 match &settings.reasoning {
-    ReasoningEffortPolicy::Default => {}
     ReasoningEffortPolicy::Omit => {
         // Do not create thinking/output_config effort controls.
     }
@@ -415,7 +394,7 @@ match &settings.reasoning {
 
 完整 `prompt_fingerprint` 当前包含 profile、model、system、tools 和 messages；稳定 `prompt_cache_key` 只包含 profile、model、system 和 tools（`onemore-cli/src/provider/mod.rs:189-225`）。新增 effort 后：
 
-- 完整请求 fingerprint 必须加入 resolved reasoning policy，保证 `Default/Omit/Send("none")/Send("high")` 可审计地区分。
+- 完整请求 fingerprint 必须加入 resolved reasoning policy，保证 `Omit/Send("medium")/Send("none")/Send("high")` 可审计地区分。
 - `prompt_cache_key` 可以继续不包含 effort，因为 effort 是生成参数，不改变输入 token 前缀；相同模型与上下文仍可复用前缀缓存。
 - 如果未来厂商明确把 effort 纳入缓存隔离键，再按 Provider Profile 调整，不能全局猜测。
 
@@ -437,8 +416,8 @@ TUI 不再从 `provider_label.split(" / ")` 反解析状态。`App` 直接保存
 
 ```text
 openai / gpt-5 / effort=high
-anthropic / claude-sonnet-4 / effort=default
-proxy / special-model / effort=omit
+anthropic / claude-sonnet-4 / effort=medium
+proxy / special-model / effort=medium
 ```
 
 显式 `none` 必须显示为 `effort=none`，不能显示成 `omit`。
@@ -464,27 +443,25 @@ reasoning picker 候选：
 
 | 模型配置 | 显示项 |
 |---|---|
-| `ReasoningCatalog::Default` | `默认` |
-| `ReasoningCatalog::Omit` | `不发送 effort` |
-| `ReasoningCatalog::Selectable` | 按配置顺序显示所有 effort |
+| 没有 reasoning table | `medium`（请求不发送字段） |
+| `send_effort=false` | `medium`（请求不发送字段） |
+| `send_effort=true` | 按配置顺序显示所有 effort，初始选中 workspace 偏好或 `medium` |
 
 即使只有一个候选，也保留第二步确认，满足“选择模型后再次选择思考程度”的一致交互。
 
 ### `/provider`
 
 1. 显示 Provider picker。
-2. 选择 Provider 后显示它的模型 picker，默认聚焦该 Provider 的 `default_model`；若是当前 Provider，聚焦当前模型。
-3. 选择模型后显示 reasoning picker。
-4. 最终一次提交 `provider + model + reasoning`。
-5. 任一步 Esc 都取消整条选择链，不产生 Session Fact。
+2. 选择 Provider 后立即发送 `SwitchProvider(provider)`，不打开模型或 reasoning picker。
+3. Runtime 切换到目标 Provider 的 `default_model`。
+4. 该模型在当前 workspace 有保存的 effort 时恢复它，否则使用 `medium`。
+5. Esc 关闭 Provider picker，不产生 Session Fact。
 
-直接输入 `/provider openai` 时也不能立刻切换；它应跳过第一步，打开 `openai` 的模型 picker。若需要无交互脚本用法，可以支持完整形式：
+直接输入 `/provider openai` 时执行同样的 Provider 切换：
 
 ```text
-/provider openai gpt-5 high
+/provider openai
 ```
-
-参数不足时进入余下 picker，参数非法时本地报错，不发送半个选择。
 
 ### `/reasoning` 与 `/effort`
 
@@ -497,7 +474,7 @@ reasoning picker 候选：
 /effort none
 ```
 
-对于 `Default` 模型只允许 `default`；对于 `Omit` 模型只允许 `omit`；对于 Selectable 模型只接受配置中的精确值。
+对于不发送 effort 的模型只允许 `medium`；对于可发送模型只接受配置中的精确值。
 
 ### 选择器状态机
 
@@ -507,9 +484,9 @@ Idle
   |-- /provider -------------> ProviderPicker
   |-- /reasoning ------------> ReasoningPicker(current provider/model)
 
-ProviderPicker --select------> ModelPicker(selected provider)
-ModelPicker ----select-------> ReasoningPicker(selected provider/model)
-ReasoningPicker -select------> send SelectModel { provider, model, reasoning }
+ProviderPicker --select------> send SwitchProvider(provider)
+ModelPicker ----select-------> ReasoningPicker(current provider/selected model)
+ReasoningPicker -select------> send SelectModel { model, effort }
 
 Any picker ------Esc---------> Idle (no command, no mutation)
 ```
@@ -518,14 +495,14 @@ Any picker ------Esc---------> Idle (no command, no mutation)
 
 ```rust
 struct PendingModelSelection {
-    provider: String,
-    model: Option<String>,
+    model: String,
+    effort_only: bool,
 }
 
 enum PickerKind {
     Provider,
-    Model { provider: String },
-    Reasoning { provider: String, model: String },
+    Model,
+    Reasoning,
     Session,
 }
 ```
@@ -537,12 +514,12 @@ enum PickerKind {
 替换分离的模型选择命令：
 
 ```rust
-AgentCommand::SelectModel(ActiveModelSelection)
+AgentCommand::SelectModel { model: String, effort: String }
 ```
 
 Runtime 处理顺序：
 
-1. 在 config catalog 中校验 provider/model/effort 组合。
+1. 以当前 Provider 组成并校验 provider/model/effort 组合。
 2. 解析 API key 与完整 `ProviderSettings`。
 3. 用模型自己的 `context_window/max_tokens` 构造新 budget 与 Provider。
 4. 先提交 Session Fact。
@@ -553,30 +530,29 @@ Runtime 处理顺序：
 
 活动 turn 中收到选择命令时沿用现有 deferred command 机制，在当前 turn 完整结束后执行，不中途改变请求编码。
 
-### Session Fact
+### Workspace 偏好与 Session Fact
 
-现有 `ModelChangeRecord` 只有 provider/model（`onemore-cli/src/session.rs:113-117`）。建议扩展为：
+workspace 偏好存放在：
+
+```text
+~/.onemore/workspaces/<sha256(canonical-workspace-key)>.json
+```
+
+只保存偏离 `medium` 的 `provider -> model -> effort` 覆盖。新 workspace、新模型和已删除覆盖都自然回到 `medium`；选择 `medium` 会删除对应项，文件为空时删除文件。
+
+Session Fact 用于审计实际发生过的选择：
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelChangeRecord {
-    pub provider: String, // config provider name, not rendered label
+    pub provider: String,
     pub model: String,
-    #[serde(default)]
-    pub reasoning: PersistedReasoningPolicy,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(tag = "mode", content = "effort", rename_all = "snake_case")]
-pub enum PersistedReasoningPolicy {
-    #[default]
-    Default,
-    Omit,
-    Send(String),
+    #[serde(default = "default_reasoning_effort")]
+    pub effort: String,
 }
 ```
 
-旧 Fact 缺少 reasoning 时反序列化为 `Default`。恢复会话时可恢复最后一个仍存在于当前 config catalog 的完整选择；若 Provider/model/effort 已从配置删除，则保留当前启动选择并发 warning，不能向未知模型静默切换。
+旧 Fact 缺少 effort 时反序列化为 `medium`。偏好负责下次启动/选择时的恢复，Fact 不反向覆盖当前 workspace 偏好。
 
 ### Agent event
 
@@ -584,10 +560,10 @@ pub enum PersistedReasoningPolicy {
 
 ```rust
 AgentEvent::ModelSelectionChanged {
-    selection: ActiveModelSelection,
+    provider: String,
+    model: String,
+    effort: String,
     label: String,
-    context_window: u64,
-    max_tokens: Option<u64>,
 }
 ```
 
@@ -600,9 +576,9 @@ TUI 只在收到此事件后更新当前状态，不能在 picker Enter 时先�
 - 一个 Provider 多模型成功解析；每个模型保留自己的窗口和输出上限。
 - `default_model` 不存在、空 models、零窗口、`max_tokens > context_window` 均拒绝。
 - model ID 含点、斜杠、冒号和连字符时精确查找。
-- reasoning table 缺失 → Default。
-- `send_effort=false` → Omit；与 efforts/default 混用拒绝。
-- `send_effort=true` 的空/重复/超长 efforts、无效 default 均拒绝。
+- reasoning table 缺失 → 选中 `medium`、请求策略为 Omit。
+- `send_effort=false` → Omit；与 efforts 混用拒绝。
+- `send_effort=true` 的空/重复/超长 efforts、缺失 `medium` 均拒绝。
 - 自定义 effort `none/xhigh/vendor_ultra` 原样保留。
 - 旧单模型格式迁移；新旧格式混用拒绝。
 
@@ -610,8 +586,8 @@ TUI 只在收到此事件后更新当前状态，不能在 picker Enter 时先�
 
 | Profile | Fixture |
 |---|---|
-| OpenAI Responses | Default 不新增；Omit 不发送；Send high；Send none；encrypted replay 不受 Omit 影响 |
-| Anthropic Messages | Default；Omit；Send high 产生 adaptive + output_config；thinking signature 多轮回放 |
+| OpenAI Responses | Omit 不发送；Send medium/high/none；encrypted replay 不受 Omit 影响 |
+| Anthropic Messages | Omit；Send high 产生 adaptive + output_config；thinking signature 多轮回放 |
 | DeepSeek Responses | Send 配置在本地拒绝，直到实现格式 fixture |
 | DeepSeek Messages | Send 配置在本地拒绝，直到实现格式 fixture |
 
@@ -623,18 +599,18 @@ TUI 只在收到此事件后更新当前状态，不能在 picker Enter 时先�
 - 无效组合与存储失败保持旧状态。
 - 一个选择只追加一个 ModelChange Fact、发送一个 event。
 - 活动 turn 中选择延迟到 turn 结束，不影响当前请求。
-- 会话恢复处理合法、已删除和旧版 ModelChange Fact。
-- 完整 fingerprint 区分 Default/Omit/Send；稳定 cache key 不因 effort 改变。
+- workspace 偏好按模型隔离；新 workspace/模型回到 medium，切回 medium 删除覆盖。
+- 完整 fingerprint 区分 Omit/Send 及不同值；稳定 cache key 不因 effort 改变。
 
 ### TUI
 
 - `/model` 只显示当前 Provider 模型，绝不出现其他 Provider 模型。
 - 模型确认后必定进入 reasoning picker，不提前发送命令。
-- `/provider` 按 Provider → model → reasoning 串联。
+- `/provider` 只发送 Provider 切换，不串联 model/reasoning picker。
 - `/reasoning` 只显示当前模型允许的候选。
 - 每一层 Esc 都不发送命令、不改变 label。
 - 最终确认只发送一个完整 `SelectModel`。
-- Default、Omit、显式 none 的状态栏显示互不混淆。
+- medium、显式 none 与其他厂商值在状态栏中原样显示。
 - direct slash 参数合法/缺失/未知时行为确定。
 
 ## 实施顺序
@@ -658,5 +634,5 @@ TUI 只在收到此事件后更新当前状态，不能在 picker Enter 时先�
 - 显式 `none` 会被发送，且不会被误判为 Omit。
 - Responses 与 Messages 仅发送自身 Profile 支持的字段。
 - 模型切换同步更新 context budget，不再沿用旧模型窗口。
-- Provider/model/effort 变化可持久恢复并可从完整 fingerprint 审计。
+- 非 medium effort 按 workspace/provider/model 持久恢复，并可从完整 fingerprint 审计。
 - reasoning effort 不造成稳定 prompt cache key 抖动。

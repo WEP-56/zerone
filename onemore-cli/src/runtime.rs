@@ -30,7 +30,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::Config;
+use crate::config::{ActiveModelSelection, Config, ProviderCatalogEntry, DEFAULT_REASONING_EFFORT};
 use crate::context::budget::{apply_budget, estimate_tokens, BudgetDecision, ContextBudget};
 use crate::context::instructions::Instructions;
 use crate::context::workspace_info::WorkspaceInfo;
@@ -47,7 +47,7 @@ use crate::session::{
     project_model_messages, CompactionRecord, ModelChangeRecord, NoticeLevel, NoticeRecord,
     SessionEntry, SessionEntryPayload,
 };
-use crate::storage::{AppPaths, SessionManager};
+use crate::storage::{AppPaths, SessionManager, WorkspacePreferences};
 use crate::tools::{
     default_registry, detect_shell, normalize_outcome, PreparedToolCall, ToolContext, ToolError,
     ToolErrorCode, ToolOutcome, ToolOutput, ToolRegistry, ToolSpec,
@@ -132,11 +132,13 @@ pub struct Agent {
     /// 上下文源(system 片段)。想加 Planning/Memory/Workspace Map,往这里 push 即可。
     extra_context: Vec<Box<dyn ContextProvider>>,
     provider: Box<dyn Provider>,
+    active_selection: ActiveModelSelection,
     budget: ContextBudget,
     retry_policy: RetryPolicy,
     config: Config,
     usage_total: Usage,
     sessions: SessionManager,
+    workspace_preferences: WorkspacePreferences,
     permissions: PermissionManager,
     hooks: HookRegistry,
     approval_rx: Option<Receiver<ApprovalResponse>>,
@@ -163,10 +165,22 @@ impl Agent {
             Box::new(WorkspaceInfo::new(&shell)),
             // ← 未来的 PlanningContext / MemoryContext 插在这里
         ];
-        let settings = config.resolve_provider(&config.active_provider)?;
-        let budget = budget_from_settings(&settings);
         let paths = AppPaths::from_root(data_dir);
         paths.ensure()?;
+        let mut active_selection = config.default_selection(&config.active_provider)?;
+        let workspace_preferences =
+            WorkspacePreferences::load(&paths.workspaces, workspace.root())?;
+        if let Some(saved) =
+            workspace_preferences.effort(&active_selection.provider, &active_selection.model)
+        {
+            let mut preferred = active_selection.clone();
+            preferred.effort = saved.to_string();
+            if config.validate_selection(&preferred).is_ok() {
+                active_selection = preferred;
+            }
+        }
+        let settings = config.resolve_selection(&active_selection)?;
+        let budget = budget_from_settings(&settings);
         let sessions = SessionManager::create(paths.sessions, workspace.root())?;
         let permissions = PermissionManager::new(config.permission_rules);
         Ok(Agent {
@@ -175,11 +189,13 @@ impl Agent {
             entries: Vec::new(),
             extra_context,
             provider: build_provider(settings),
+            active_selection,
             budget,
             retry_policy: RetryPolicy::default(),
             config,
             usage_total: Usage::default(),
             sessions,
+            workspace_preferences,
             permissions,
             hooks: HookRegistry::default(),
             approval_rx: None,
@@ -189,6 +205,10 @@ impl Agent {
 
     pub fn provider_label(&self) -> String {
         self.provider.label()
+    }
+
+    pub fn active_selection(&self) -> &ActiveModelSelection {
+        &self.active_selection
     }
 
     pub fn session_id(&self) -> &str {
@@ -241,33 +261,27 @@ impl Agent {
                 true
             }
             AgentCommand::SwitchProvider(name) => {
-                match self.config.resolve_provider(&name) {
-                    Ok(settings) => {
-                        self.budget = budget_from_settings(&settings);
-                        self.provider = build_provider(settings);
-                        self.record_model_change(emit);
-                        emit(AgentEvent::ProviderChanged {
-                            label: self.provider.label(),
-                        });
-                        emit(AgentEvent::Notice(format!(
-                            "已切换到 {}(历史保留)",
-                            self.provider.label()
-                        )));
-                    }
-                    Err(e) => emit(AgentEvent::Error(format!("切换失败: {:#}", e))),
+                match self.preferred_default_selection(&name) {
+                    Ok(selection) => self.apply_model_selection(selection, emit),
+                    Err(error) => emit(AgentEvent::Error(format!("切换失败: {:#}", error))),
                 }
                 true
             }
-            AgentCommand::SetModel(model) => {
-                self.provider.set_model(model);
-                self.record_model_change(emit);
-                emit(AgentEvent::ProviderChanged {
-                    label: self.provider.label(),
-                });
-                emit(AgentEvent::Notice(format!(
-                    "模型已设为 {}",
-                    self.provider.label()
-                )));
+            AgentCommand::SelectModel { model, effort } => {
+                self.apply_model_selection(
+                    ActiveModelSelection {
+                        provider: self.active_selection.provider.clone(),
+                        model,
+                        effort,
+                    },
+                    emit,
+                );
+                true
+            }
+            AgentCommand::SetReasoningEffort(effort) => {
+                let mut selection = self.active_selection.clone();
+                selection.effort = effort;
+                self.apply_model_selection(selection, emit);
                 true
             }
             AgentCommand::ListSessions => {
@@ -302,13 +316,91 @@ impl Agent {
         }
     }
 
-    /// provider/model 变化是会话事实:恢复会话时可以据此解释历史。
-    fn record_model_change(&mut self, emit: &mut dyn FnMut(AgentEvent)) {
-        let payload = SessionEntryPayload::ModelChange(ModelChangeRecord {
-            provider: self.provider.label(),
-            model: self.provider.model().to_string(),
+    fn preferred_default_selection(&self, provider: &str) -> anyhow::Result<ActiveModelSelection> {
+        let mut selection = self.config.default_selection(provider)?;
+        if let Some(saved) = self
+            .workspace_preferences
+            .effort(&selection.provider, &selection.model)
+        {
+            let mut preferred = selection.clone();
+            preferred.effort = saved.to_string();
+            if self.config.validate_selection(&preferred).is_ok() {
+                selection = preferred;
+            }
+        }
+        Ok(selection)
+    }
+
+    fn apply_model_selection(
+        &mut self,
+        selection: ActiveModelSelection,
+        emit: &mut dyn FnMut(AgentEvent),
+    ) {
+        let settings = match self.config.resolve_selection(&selection) {
+            Ok(settings) => settings,
+            Err(error) => {
+                emit(AgentEvent::Error(format!("切换失败: {:#}", error)));
+                return;
+            }
+        };
+        let next_budget = budget_from_settings(&settings);
+        let next_provider = build_provider(settings);
+        let previous_effort = self
+            .workspace_preferences
+            .effort(&selection.provider, &selection.model)
+            .map(str::to_string);
+        if let Err(error) = self.workspace_preferences.set_effort(
+            &selection.provider,
+            &selection.model,
+            &selection.effort,
+        ) {
+            emit(AgentEvent::Error(format!(
+                "保存 workspace 思考程度失败,未切换模型: {:#}",
+                error
+            )));
+            return;
+        }
+        if !self.record_model_change(&selection, emit) {
+            let restore = previous_effort
+                .as_deref()
+                .unwrap_or(DEFAULT_REASONING_EFFORT);
+            if let Err(error) = self.workspace_preferences.set_effort(
+                &selection.provider,
+                &selection.model,
+                restore,
+            ) {
+                emit(AgentEvent::Error(format!(
+                    "回滚 workspace 思考程度失败: {:#}",
+                    error
+                )));
+            }
+            return;
+        }
+        self.provider = next_provider;
+        self.budget = next_budget;
+        self.active_selection = selection.clone();
+        let label = self.provider.label();
+        emit(AgentEvent::ModelSelectionChanged {
+            provider: selection.provider,
+            model: selection.model,
+            effort: selection.effort,
+            label: label.clone(),
         });
-        self.commit(vec![payload], emit);
+        emit(AgentEvent::Notice(format!("已切换到 {}(历史保留)", label)));
+    }
+
+    /// provider/model/effort 变化是会话事实:恢复会话时可以据此解释历史。
+    fn record_model_change(
+        &mut self,
+        selection: &ActiveModelSelection,
+        emit: &mut dyn FnMut(AgentEvent),
+    ) -> bool {
+        let payload = SessionEntryPayload::ModelChange(ModelChangeRecord {
+            provider: selection.provider.clone(),
+            model: selection.model.clone(),
+            effort: selection.effort.clone(),
+        });
+        self.commit(vec![payload], emit)
     }
 
     /// 把一批事实原子落库;成功则推进内存镜像并返回 true。
@@ -1362,9 +1454,10 @@ pub struct RuntimeHandle {
     /// 置 true 请求取消当前轮;Runtime 会在收尾后自行复位。
     pub cancel: Arc<AtomicBool>,
     pub provider_label: String,
-    pub provider_names: Vec<String>,
-    /// 配置文件中出现过的模型，供 TUI 提供真实而有限的选择目录。
-    pub model_names: Vec<String>,
+    pub active_selection: ActiveModelSelection,
+    pub provider_catalog: Vec<ProviderCatalogEntry>,
+    pub reasoning_preferences:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     pub session_id: String,
 }
 
@@ -1372,8 +1465,9 @@ pub struct RuntimeHandle {
 /// headless 前端不需要线程,直接调 `Agent::handle_command`。
 pub fn spawn(agent: Agent) -> RuntimeHandle {
     let provider_label = agent.provider_label();
-    let provider_names = agent.config.provider_names();
-    let model_names = agent.config.model_names();
+    let active_selection = agent.active_selection.clone();
+    let provider_catalog = agent.config.provider_catalog();
+    let reasoning_preferences = agent.workspace_preferences.reasoning_efforts();
     let session_id = agent.session_id().to_string();
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<AgentCommand>();
     let (approval_tx, approval_rx) = std::sync::mpsc::channel::<ApprovalResponse>();
@@ -1414,8 +1508,9 @@ pub fn spawn(agent: Agent) -> RuntimeHandle {
         events: evt_rx,
         cancel,
         provider_label,
-        provider_names,
-        model_names,
+        active_selection,
+        provider_catalog,
+        reasoning_preferences,
         session_id,
     }
 }
@@ -1573,10 +1668,6 @@ mod tests {
             &self.model
         }
 
-        fn set_model(&mut self, model: String) {
-            self.model = model;
-        }
-
         fn stream_turn(
             &self,
             prompt: &PromptContext,
@@ -1635,6 +1726,96 @@ api_key = ""
         ));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn multi_model_config(root: &std::path::Path) -> Config {
+        let path = root.join("multi-model-config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[agent]
+provider = "mock"
+
+[providers.mock]
+api = "responses"
+profile = "openai"
+base_url = "http://127.0.0.1:1"
+api_key = ""
+default_model = "small"
+
+[providers.mock.models.small]
+context_window = 32000
+max_tokens = 4096
+
+[providers.mock.models.large]
+context_window = 200000
+max_tokens = 32000
+
+[providers.mock.models.large.reasoning]
+send_effort = true
+efforts = ["low", "medium", "high"]
+"#,
+        )
+        .unwrap();
+        Config::load(&path).unwrap()
+    }
+
+    #[test]
+    fn model_selection_updates_budget_records_one_fact_and_persists_effort() {
+        let root = temp_root("model-selection");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let data_dir = root.join("data");
+        let mut agent = Agent::new_with_data_dir(
+            multi_model_config(&root),
+            Workspace::new(workspace_root.clone()),
+            data_dir.clone(),
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        agent.handle_command(
+            AgentCommand::SelectModel {
+                model: "large".into(),
+                effort: "high".into(),
+            },
+            &mut |event| events.push(event),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(agent.active_selection.model, "large");
+        assert_eq!(agent.active_selection.effort, "high");
+        assert_eq!(agent.budget.context_window, Some(200000));
+        assert_eq!(agent.budget.reserve_output, 32000);
+        assert_eq!(
+            agent
+                .entries
+                .iter()
+                .filter(|entry| matches!(&entry.payload, SessionEntryPayload::ModelChange(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ModelSelectionChanged { .. }))
+                .count(),
+            1
+        );
+
+        let restarted = Agent::new_with_data_dir(
+            multi_model_config(&root),
+            Workspace::new(workspace_root),
+            data_dir,
+        )
+        .unwrap();
+        // 新启动仍从 provider 默认模型开始；偏好是按模型保存的，不会泄漏到 small。
+        assert_eq!(restarted.active_selection.model, "small");
+        assert_eq!(restarted.active_selection.effort, DEFAULT_REASONING_EFFORT);
+        assert_eq!(
+            restarted.workspace_preferences.effort("mock", "large"),
+            Some("high")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn output(message: ChatMessage, stop: StopReason) -> crate::provider::TurnOutput {

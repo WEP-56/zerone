@@ -38,8 +38,10 @@ pub enum AgentCommand {
     ClearConversation,
     /// 切换到 config.toml 里的另一个 provider profile(/provider)。
     SwitchProvider(String),
-    /// 覆盖当前 provider 的模型名(/model)。
-    SetModel(String),
+    /// 在当前 provider 内原子选择模型与思考程度(/model)。
+    SelectModel { model: String, effort: String },
+    /// 只调整当前模型的思考程度(/reasoning 或 /effort)。
+    SetReasoningEffort(String),
     /// 列出当前 workspace 的历史会话(/session)。
     ListSessions,
     /// 恢复当前 workspace 的一个历史会话(/session <id>)。
@@ -111,8 +113,11 @@ pub enum AgentEvent {
     Notice(String),
     /// 会话历史已清空(前端应同步清空画面)。
     ConversationCleared,
-    /// provider/模型已变化,`label` 是新的显示名(状态栏用)。
-    ProviderChanged {
+    /// provider/model/effort 已原子变化。
+    ModelSelectionChanged {
+        provider: String,
+        model: String,
+        effort: String,
         label: String,
     },
     /// 当前 workspace 的会话列表。

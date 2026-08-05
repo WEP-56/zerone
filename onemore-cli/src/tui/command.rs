@@ -6,6 +6,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommand {
     Model,
+    Reasoning,
     Provider,
     Session,
     Queue,
@@ -29,6 +30,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         command: SlashCommand::Model,
         name: "model",
         description: "选择当前 provider 使用的模型",
+        accepts_args: true,
+    },
+    CommandSpec {
+        command: SlashCommand::Reasoning,
+        name: "reasoning",
+        description: "调整当前模型的思考程度",
         accepts_args: true,
     },
     CommandSpec {
@@ -76,7 +83,11 @@ pub const COMMANDS: &[CommandSpec] = &[
 ];
 
 pub fn find(name: &str) -> Option<&'static CommandSpec> {
-    let canonical = if name == "exit" { "quit" } else { name };
+    let canonical = match name {
+        "exit" => "quit",
+        "effort" => "reasoning",
+        _ => name,
+    };
     COMMANDS.iter().find(|spec| spec.name == canonical)
 }
 
@@ -137,6 +148,14 @@ mod tests {
     #[test]
     fn exit_is_a_quit_alias() {
         assert_eq!(find("exit").map(|s| s.command), Some(SlashCommand::Quit));
+    }
+
+    #[test]
+    fn effort_is_a_reasoning_alias() {
+        assert_eq!(
+            find("effort").map(|s| s.command),
+            Some(SlashCommand::Reasoning)
+        );
     }
 
     #[test]

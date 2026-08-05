@@ -18,11 +18,14 @@
 //! 3. **旧库迁移原子化**:旧库在单个事务里迁移到当前 schema,
 //!    任何一步失败都回滚,原库保持可用。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::message::{Block, CacheUsage, ChatMessage, Role, Usage};
 use crate::session::{
@@ -42,6 +45,7 @@ pub struct AppPaths {
     pub root: PathBuf,
     pub config: PathBuf,
     pub sessions: PathBuf,
+    pub workspaces: PathBuf,
 }
 
 impl AppPaths {
@@ -58,13 +62,121 @@ impl AppPaths {
         AppPaths {
             config: root.join("config.toml"),
             sessions: root.join("sessions"),
+            workspaces: root.join("workspaces"),
             root,
         }
     }
 
     pub fn ensure(&self) -> Result<()> {
         std::fs::create_dir_all(&self.sessions)
-            .with_context(|| format!("创建数据目录 {} 失败", self.sessions.display()))
+            .with_context(|| format!("创建数据目录 {} 失败", self.sessions.display()))?;
+        std::fs::create_dir_all(&self.workspaces)
+            .with_context(|| format!("创建数据目录 {} 失败", self.workspaces.display()))
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WorkspacePreferencesFile {
+    #[serde(default)]
+    reasoning_efforts: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Workspace 级模型偏好。只保存用户偏离默认 `medium` 的选择；配置与会话事实
+/// 仍各自负责能力目录和历史审计。
+pub struct WorkspacePreferences {
+    path: PathBuf,
+    file: WorkspacePreferencesFile,
+}
+
+impl WorkspacePreferences {
+    pub fn load(workspaces_dir: &Path, workspace: &Path) -> Result<Self> {
+        std::fs::create_dir_all(workspaces_dir).with_context(|| {
+            format!("创建 workspace 偏好目录 {} 失败", workspaces_dir.display())
+        })?;
+        let key = workspace_key(workspace);
+        let digest = Sha256::digest(key.as_bytes());
+        let hash = digest
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect::<String>();
+        let path = workspaces_dir.join(format!("{}.json", hash));
+        let file = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("解析 workspace 偏好 {} 失败", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                WorkspacePreferencesFile::default()
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("读取 workspace 偏好 {} 失败", path.display()))
+            }
+        };
+        Ok(Self { path, file })
+    }
+
+    pub fn effort(&self, provider: &str, model: &str) -> Option<&str> {
+        self.file
+            .reasoning_efforts
+            .get(provider)
+            .and_then(|models| models.get(model))
+            .map(String::as_str)
+    }
+
+    pub fn reasoning_efforts(&self) -> BTreeMap<String, BTreeMap<String, String>> {
+        self.file.reasoning_efforts.clone()
+    }
+
+    /// `medium` 是系统默认值，不写入磁盘；切回 medium 会删除已有覆盖。
+    pub fn set_effort(&mut self, provider: &str, model: &str, effort: &str) -> Result<()> {
+        let mut next = self.file.clone();
+        if effort == crate::config::DEFAULT_REASONING_EFFORT {
+            if let Some(models) = next.reasoning_efforts.get_mut(provider) {
+                models.remove(model);
+                if models.is_empty() {
+                    next.reasoning_efforts.remove(provider);
+                }
+            }
+        } else {
+            next.reasoning_efforts
+                .entry(provider.to_string())
+                .or_default()
+                .insert(model.to_string(), effort.to_string());
+        }
+        self.write_file(&next)?;
+        self.file = next;
+        Ok(())
+    }
+
+    fn write_file(&self, file: &WorkspacePreferencesFile) -> Result<()> {
+        if file.reasoning_efforts.is_empty() {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("删除 workspace 偏好 {} 失败", self.path.display())
+                    })
+                }
+            }
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec_pretty(file)?;
+        let temp = self
+            .path
+            .with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&temp, bytes)
+            .with_context(|| format!("写入 workspace 偏好临时文件 {} 失败", temp.display()))?;
+        if self.path.exists() {
+            std::fs::remove_file(&self.path)
+                .with_context(|| format!("替换 workspace 偏好 {} 失败", self.path.display()))?;
+        }
+        std::fs::rename(&temp, &self.path).with_context(|| {
+            format!(
+                "提交 workspace 偏好 {} -> {} 失败",
+                temp.display(),
+                self.path.display()
+            )
+        })
     }
 }
 
@@ -590,6 +702,33 @@ mod tests {
 
     fn message_payload(message: ChatMessage) -> SessionEntryPayload {
         SessionEntryPayload::message(message, None)
+    }
+
+    #[test]
+    fn workspace_reasoning_preferences_default_to_medium_and_only_store_overrides() {
+        let root = temp_root("reasoning-preferences");
+        let workspaces = root.join("preferences");
+        let workspace = root.join("workspace-a");
+        let other_workspace = root.join("workspace-b");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&other_workspace).unwrap();
+
+        let mut preferences = WorkspacePreferences::load(&workspaces, &workspace).unwrap();
+        assert_eq!(preferences.effort("openai", "gpt-5"), None);
+        preferences.set_effort("openai", "gpt-5", "high").unwrap();
+        assert!(preferences.path.exists());
+
+        let reloaded = WorkspacePreferences::load(&workspaces, &workspace).unwrap();
+        assert_eq!(reloaded.effort("openai", "gpt-5"), Some("high"));
+        let other = WorkspacePreferences::load(&workspaces, &other_workspace).unwrap();
+        assert_eq!(other.effort("openai", "gpt-5"), None);
+
+        preferences
+            .set_effort("openai", "gpt-5", crate::config::DEFAULT_REASONING_EFFORT)
+            .unwrap();
+        assert_eq!(preferences.effort("openai", "gpt-5"), None);
+        assert!(!preferences.path.exists(), "切回 medium 应删除空偏好文件");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

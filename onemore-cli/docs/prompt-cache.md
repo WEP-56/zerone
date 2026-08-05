@@ -53,6 +53,13 @@ Several intentional operations create a cache boundary:
 
 Those operations must remain correct even when they cause a cache miss.
 
+Reasoning effort is handled on two separate identities. The full diagnostic
+prompt fingerprint includes the resolved effort policy, so `Omit`, `medium`,
+`none`, and `high` remain auditable. The stable OpenAI prompt-family cache key
+does not include effort: effort changes generation behavior, not the reusable
+input-token prefix. Encrypted reasoning replay is also independent from effort
+field emission.
+
 ## Provider Policy
 
 Provider support is not inferred from the endpoint name.
@@ -158,7 +165,8 @@ Current implementation status:
 
 - A provider that does not report cache usage behaves exactly as before.
 - An unsupported cache field is never sent.
-- Identical consecutive prompt prefixes have identical local fingerprints.
+- Identical prompt prefixes and generation settings have identical local fingerprints.
+- Changing only reasoning effort changes the full fingerprint but not the stable prompt-family cache key.
 - A cache miss cannot alter messages, tool calls, permissions, or session facts.
 - Wire fixtures verify cache-usage parsing and provider-specific request shape.
 

@@ -78,8 +78,14 @@ pub struct ProviderCapabilities {
     pub input_files: bool,
     pub server_web_search: bool,
     pub parallel_tool_calls_control: bool,
+    pub reasoning_effort_format: ReasoningEffortFormat,
 }
 ```
+
+`ReasoningEffortFormat` is an encoder choice, not a support boolean: OpenAI
+Responses uses `reasoning.effort`, while Anthropic Messages uses adaptive
+`thinking` plus `output_config.effort`. DeepSeek profiles remain unsupported
+until their distinct wire shape has a fixture.
 
 The exact representation may evolve, but every feature must have a declared
 default of unsupported.
