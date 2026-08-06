@@ -22,7 +22,7 @@ cargo run -- --once "你好"
 cargo run -- -p deepseek
 ```
 
-首次运行会生成 `~/.onemore/config.toml`. 也可以设置 `ONEMORE_HOME` 将配置和会话
+首次运行会在平台数据目录生成 `config.toml`(Windows 默认 `%APPDATA%\onemore`). 也可以设置 `ONEMORE_HOME` 将配置和会话
 放到独立目录:
 
 ```powershell
@@ -188,12 +188,14 @@ workspace/provider/model 保存；切回该模型的 `default_effort` 时删除�
 ## 存储
 
 ```text
-~/.onemore/
+%APPDATA%/onemore/  # Windows 默认；其他平台使用 XDG 数据目录
   config.toml
   sessions/
     <session-id>.db            # schema v4:事实日志 + 严格计划 reducer + token/cache 用量
   workspaces/
     <workspace-hash>.json      # 仅保存偏离各模型 default_effort 的思考程度
+  skills/
+    <skill-name>/SKILL.md      # 全局技能；工作区技能位于当前项目 .onemore/skills/
 ```
 
 Onemore 不读取 `~/.zerone`,也不识别 `ZERONE_HOME`,因此两个程序的配置、密钥和会话
@@ -206,7 +208,7 @@ messages 表)数据库在打开时自动迁移到当前 schema,迁移失败回�
 
 ```powershell
 .\scripts\package-npm.ps1 -Pack
-npm install --global .\dist\npm\onemore-agent-0.4.0.tgz
+npm install --global .\dist\npm\onemore-agent-0.5.0.tgz
 onemore --help
 ```
 

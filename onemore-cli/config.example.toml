@@ -1,4 +1,4 @@
-# Onemore 全局配置文件(~/.onemore/config.toml)
+# Onemore 全局配置文件(Windows 默认 %APPDATA%/onemore/config.toml)
 # [agent].provider 决定当前用哪个 [providers.*];TUI 里可用 /provider 名字 热切换。
 
 [agent]

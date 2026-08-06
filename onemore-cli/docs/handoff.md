@@ -13,15 +13,16 @@ Read that document before designing advanced features. It contains the evidence-
 Recommended implementation order from the research:
 
 1. ~~`update_plan` and long-running task discipline~~ (implemented 2026-08-05, user-verified 2026-08-06);
-2. Skills (next session);
-3. MCP stdio integration;
+2. ~~Skills~~ (implemented 2026-08-06, user-verified through TUI and packaged Windows npm flow);
+3. MCP stdio integration (next);
 4. durable background processes, then subagents.
 
 ## Current Onemore State
 
 Repository: `E:\harness from scratch\onemore-cli`
 
-Current version: `0.4.0`
+Source crate version: `0.4.0`
+Windows npm test package: `onemore-agent@0.5.0`
 
 Implemented foundations:
 
@@ -33,10 +34,12 @@ Implemented foundations:
 - stable OpenAI `prompt_cache_key` and SHA-256 prompt fingerprints;
 - append-only session facts, compaction, context budgeting, permissions, hooks, retries, cancellation, steering/follow-up, controlled tool concurrency, and resource locks.
 - structured `update_plan`, strict revision reducer, committed plan events, bounded long-task reminders, cancellation repair, compaction projection, and CLI/TUI restore.
+- startup-frozen Skills catalog with bounded Repo/User discovery, YAML frontmatter validation,
+  deterministic scope/name/path precedence, SHA-256 stale checks, lazy `load_skill`, XML-bounded
+  skill results, `/skill` TUI picker, and platform-global skill storage.
 
 Intentionally absent:
 
-- Skills;
 - MCP client/server integration;
 - background processes as durable tasks;
 - subagents.
@@ -48,8 +51,16 @@ User acceptance testing on 2026-08-06 confirmed:
 - standard and custom reasoning effort lists are selectable in the TUI and are sent correctly by the configured provider;
 - `update_plan` works through the full plan lifecycle and survives the intended runtime/UI path;
 - long-running task reminders behave as intended without preventing completion.
+- Skills are discovered from workspace and global roots and can be explicitly selected with `/skill`;
+  selection sends an ordinary `UserInput` and the Agent loads the skill through `load_skill`.
+- Agent-guided skill installation was exercised from GitHub repositories, skill collection sites,
+  and local paths. Installation uses existing `run_command`/`write_file` approval boundaries and
+  requires a restart before the frozen catalog sees newly installed content.
+- The Windows-only npm package `onemore-agent@0.5.0` installs and starts successfully from its
+  local tarball; it contains only `win32-x64`.
 
-The next session should begin the Skills implementation. Keep the existing plan reducer, fact/event boundaries, and prompt-cache constraints intact while adding skill discovery and loading.
+The next session should begin MCP stdio implementation. Keep the existing plan reducer, fact/event
+boundaries, tool permission layer, deterministic tool ordering, and prompt-cache constraints intact.
 
 Relevant Onemore files:
 
@@ -61,9 +72,14 @@ src/storage.rs              append-only SQLite persistence
 src/tools/mod.rs            tool contracts, registry, validation
 src/tools/update_plan.rs    complete-snapshot update_plan tool and effect
 src/context/mod.rs          system context composition
+src/context/skills.rs       stable skill catalog system section
+src/skills.rs               bounded discovery, parsing, hashing, lazy loading
+src/tools/load_skill.rs     lazy skill loader tool and installation guidance
 src/provider/mod.rs         provider capabilities and prompt identity
 src/event.rs                Runtime/frontend event boundary
 src/tui/mod.rs              event rendering and interactive UI
+src/tui/command.rs          slash command catalog including `/skill`
+src/storage.rs              platform data root (`%APPDATA%\\onemore` on Windows)
 docs/prompt-cache-cn.md      cache design and current implementation status
 docs/api-compatibility-cn.md provider compatibility design
 ```
@@ -139,7 +155,7 @@ Questions:
 - How are plan updates emitted to the frontend without polluting model history?
 - What survives compaction and session restore?
 
-### Skills (Next Session)
+### Skills (Implemented)
 
 Grok Build:
 
@@ -170,6 +186,10 @@ Questions:
 - How are malformed or conflicting skills handled?
 - How do skill tools pass through permission and capability checks?
 - How does discovery avoid invalidating prompt caches every turn?
+
+Onemore v1 decisions: Windows global data and skills live under `%APPDATA%\\onemore`; workspace
+skills live under `<workspace>/.onemore/skills`; the catalog is frozen per Runtime; installation
+is intentionally performed by existing approved tools rather than by `load_skill` itself.
 
 ### MCP
 
@@ -256,6 +276,5 @@ Treat this document as the baseline for follow-up design. The research pass itse
 ```powershell
 Get-Content "E:\harness from scratch\onemore-cli\docs\handoff.md"
 Get-Content "E:\harness from scratch\onemore-cli\docs\open-source-agent-research.md"
-rg -n "todo_write|update_plan" "E:\harness from scratch\example\grok-build\crates" "E:\harness from scratch\example\codex\codex-rs"
-rg -n "skill|MCP|spawn_agent|subagent" "E:\harness from scratch\example\grok-build\crates" "E:\harness from scratch\example\codex\codex-rs\core\src"
+rg -n "initialize|tools/list|tools/call|cancellation|timeout|shutdown" "E:\harness from scratch\example\grok-build\crates\codegen\xai-grok-mcp" "E:\harness from scratch\example\codex\codex-rs\codex-mcp"
 ```

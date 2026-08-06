@@ -24,7 +24,7 @@ const HELP: &str = "Onemore —— 可靠、实用的 Coding Agent
   onemore --once <提示词...>   无界面跑一轮(方便调试/脚本化)
 
 选项:
-  -c, --config <路径>    配置文件(默认 ~/.onemore/config.toml,不存在会生成模板)
+  -c, --config <路径>    配置文件(默认平台数据目录/config.toml,不存在会生成模板)
   -p, --provider <名字>  覆盖 [agent].provider
   -h, --help             显示本帮助
 ";

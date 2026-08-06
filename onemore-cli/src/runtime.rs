@@ -162,7 +162,7 @@ impl Agent {
         Self::new_with_data_dir(config, workspace, paths.root)
     }
 
-    /// 显式指定数据目录，供测试与嵌入场景隔离用户的 `~/.onemore`。
+    /// 显式指定数据目录，供测试与嵌入场景隔离平台数据目录。
     pub fn new_with_data_dir(
         config: Config,
         workspace: Workspace,

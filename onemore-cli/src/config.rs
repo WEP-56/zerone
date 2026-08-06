@@ -731,7 +731,7 @@ fn parse_permission_rule(
 }
 
 /// 首次运行时写出的模板(同时也是 config.example.toml 的内容)。
-pub const EXAMPLE_CONFIG: &str = r#"# Onemore 全局配置文件(~/.onemore/config.toml)
+pub const EXAMPLE_CONFIG: &str = r#"# Onemore 全局配置文件(Windows 默认 %APPDATA%/onemore/config.toml)
 # [agent].provider 决定当前用哪个 [providers.*];TUI 里可用 /provider 名字 热切换。
 
 [agent]
