@@ -6,7 +6,7 @@
 
 同时这个仓库的[docs](docs)也是我学习与实践后的总结文档，共九个，包含从零构建到后续扩展的所有历程。我同时还深度清洗并阅读了 Pi 的实现，清洗后的代码在：[pi](example/pi)。我记录了它的优秀实现，并汇总出 7 篇文档；它们关注如何让现在的 Zerone 从一个 MVP 进化成可靠、消费级的 coding agent：[docs/pi](docs/pi)
 
-我自己的实践：我自己也正在基于zerone与总结的文档，完成一个Pi级别的coding agent，详见：[onemore](onemore-cli)
+我自己的实践：我自己也正在基于zerone与总结的文档，完成一个Pi级别的coding agent，详见：[onemore](https://github.com/WEP-56/onemore)
 
 ```
 TUI / --once ◄──AgentEvent──┐
