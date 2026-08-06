@@ -534,5 +534,11 @@ mod tests {
             "signed-value"
         );
         assert!(body.get("reasoning").is_none());
+
+        let mut max_settings = provider().settings;
+        max_settings.selected_effort = "max".into();
+        max_settings.reasoning_effort = ReasoningEffortPolicy::Send("max".into());
+        let max = AnthropicProvider::new(max_settings).build_body(&prompt, &[]);
+        assert_eq!(max["output_config"]["effort"], "max");
     }
 }

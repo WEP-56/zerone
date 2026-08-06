@@ -159,6 +159,19 @@ fn run_once(mut agent: Agent, prompt: String) -> Result<()> {
             AgentEvent::PermissionResolved { allowed, .. } => {
                 eprintln!("  {}", if allowed { "已允许" } else { "未允许" });
             }
+            AgentEvent::PlanUpdated {
+                revision,
+                items,
+                explanation,
+            } => {
+                eprintln!("· 计划 #{}", revision);
+                if let Some(explanation) = explanation {
+                    eprintln!("  {}", explanation);
+                }
+                for item in items {
+                    eprintln!("  [{}] {}: {}", item.status.as_str(), item.id, item.text);
+                }
+            }
             AgentEvent::Usage {
                 input_tokens,
                 output_tokens,

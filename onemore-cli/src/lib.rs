@@ -17,6 +17,7 @@ pub mod event;
 pub mod hooks;
 pub mod message;
 pub mod permission;
+pub mod plan;
 pub mod provider;
 pub mod runtime;
 pub mod session;

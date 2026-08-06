@@ -12,15 +12,16 @@ Read that document before designing advanced features. It contains the evidence-
 
 Recommended implementation order from the research:
 
-1. `todo_write` / `update_plan` and long-running task discipline;
-2. Skills and MCP integration;
-3. Subagents launched and coordinated by the main agent.
+1. ~~`update_plan` and long-running task discipline~~ (completed 2026-08-05);
+2. Skills;
+3. MCP stdio integration;
+4. durable background processes, then subagents.
 
 ## Current Onemore State
 
 Repository: `E:\harness from scratch\onemore-cli`
 
-Current version: `0.3.0`
+Current version: `0.4.0`
 
 Implemented foundations:
 
@@ -31,11 +32,10 @@ Implemented foundations:
 - prompt-cache usage parsing, accumulation, persistence, and CLI/TUI display;
 - stable OpenAI `prompt_cache_key` and SHA-256 prompt fingerprints;
 - append-only session facts, compaction, context budgeting, permissions, hooks, retries, cancellation, steering/follow-up, controlled tool concurrency, and resource locks.
+- structured `update_plan`, strict revision reducer, committed plan events, bounded long-task reminders, cancellation repair, compaction projection, and CLI/TUI restore.
 
 Intentionally absent:
 
-- structured Todo/Task facts and tools;
-- automatic long-task planning discipline;
 - Skills;
 - MCP client/server integration;
 - background processes as durable tasks;
@@ -45,9 +45,11 @@ Relevant Onemore files:
 
 ```text
 src/runtime.rs              agent loop, ActiveRun, queues, tool batches
+src/plan.rs                 plan types, invariants, reducer, compaction projection
 src/session.rs              facts and model projection
 src/storage.rs              append-only SQLite persistence
 src/tools/mod.rs            tool contracts, registry, validation
+src/tools/update_plan.rs    complete-snapshot update_plan tool and effect
 src/context/mod.rs          system context composition
 src/provider/mod.rs         provider capabilities and prompt identity
 src/event.rs                Runtime/frontend event boundary
@@ -95,6 +97,8 @@ Do not treat either repository as code to copy wholesale. Extract invariants, st
 ## Suggested Entry Points
 
 ### Todo And Long Tasks
+
+Implemented in Onemore as of 2026-08-05. Keep the references and questions below as regression/design evidence; new work should not replace the strict reducer with prompt-only validation or UI-only state.
 
 Grok Build:
 

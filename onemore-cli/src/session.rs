@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::message::{Block, ChatMessage, Role, Usage};
+use crate::plan::{reduce_plan, PlanSnapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEntry {
@@ -22,6 +23,8 @@ pub enum SessionEntryPayload {
     Artifact(ArtifactRef),
     Compaction(CompactionRecord),
     ModelChange(ModelChangeRecord),
+    PlanUpdated(PlanSnapshot),
+    PlanReminder(PlanReminderRecord),
 }
 
 impl SessionEntryPayload {
@@ -52,6 +55,8 @@ impl SessionEntryPayload {
             SessionEntryPayload::Artifact(_) => "artifact",
             SessionEntryPayload::Compaction(_) => "compaction",
             SessionEntryPayload::ModelChange(_) => "model_change",
+            SessionEntryPayload::PlanUpdated(_) => "plan_updated",
+            SessionEntryPayload::PlanReminder(_) => "plan_reminder",
         }
     }
 }
@@ -119,6 +124,35 @@ pub struct ModelChangeRecord {
     pub effort: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanReminderRecord {
+    pub revision: u64,
+    pub reason: PlanReminderReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReminderReason {
+    Continue,
+    Cancelled,
+}
+
+impl PlanReminderRecord {
+    fn model_message(self) -> ChatMessage {
+        let text = match self.reason {
+            PlanReminderReason::Continue => format!(
+                "[Plan reminder] Plan revision {} still has active items. Continue the work. If the work is actually finished, call update_plan with the complete current snapshot before giving the final response.",
+                self.revision
+            ),
+            PlanReminderReason::Cancelled => format!(
+                "[Plan state after cancellation] The in-progress item was returned to pending. The current plan revision is {}.",
+                self.revision
+            ),
+        };
+        ChatMessage::user_text(text)
+    }
+}
+
 fn default_reasoning_effort() -> String {
     crate::config::DEFAULT_REASONING_EFFORT.to_string()
 }
@@ -172,6 +206,7 @@ pub fn application_messages(entries: &[SessionEntry]) -> Vec<ChatMessage> {
 }
 
 pub fn project_model_messages(entries: &[SessionEntry]) -> ModelProjection {
+    let plan = reduce_plan(entries);
     let last_compaction = entries
         .iter()
         .rposition(|entry| matches!(entry.payload, SessionEntryPayload::Compaction(_)));
@@ -193,24 +228,33 @@ pub fn project_model_messages(entries: &[SessionEntry]) -> ModelProjection {
         None => 0,
     };
     for entry in &entries[start..] {
-        if let SessionEntryPayload::Message(record) = &entry.payload {
-            messages.push(record.message.clone());
-            let usage_baseline = if record.message.role == Role::Assistant {
-                record.usage
-            } else {
-                None
-            };
-            match usage_baseline {
-                Some(usage) => {
-                    known_token_baseline =
-                        Some(usage.input_tokens.saturating_add(usage.output_tokens));
-                    tail_chars_after_baseline = 0;
+        match &entry.payload {
+            SessionEntryPayload::Message(record) => {
+                messages.push(record.message.clone());
+                let usage_baseline = if record.message.role == Role::Assistant {
+                    record.usage
+                } else {
+                    None
+                };
+                match usage_baseline {
+                    Some(usage) => {
+                        known_token_baseline =
+                            Some(usage.input_tokens.saturating_add(usage.output_tokens));
+                        tail_chars_after_baseline = 0;
+                    }
+                    None => tail_chars_after_baseline += message_chars(&record.message),
                 }
-                None => tail_chars_after_baseline += message_chars(&record.message),
             }
+            SessionEntryPayload::PlanReminder(reminder) => {
+                let message = reminder.model_message();
+                tail_chars_after_baseline += message_chars(&message);
+                messages.push(message);
+            }
+            _ => {}
         }
     }
-    let (messages, diagnostics) = repair_tool_pairs(messages);
+    let (messages, mut diagnostics) = repair_tool_pairs(messages);
+    diagnostics.extend(plan.diagnostics);
     ModelProjection {
         messages,
         diagnostics,
@@ -342,6 +386,7 @@ pub fn validate_new_message_batch(payloads: &[SessionEntryPayload]) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::{PlanItem, PlanStatus};
 
     fn entry(payload: SessionEntryPayload) -> SessionEntry {
         SessionEntry {
@@ -367,6 +412,29 @@ mod tests {
         let projection = project_model_messages(&entries);
         assert_eq!(projection.messages.len(), 1);
         assert_eq!(projection.messages[0].text(), "hello");
+    }
+
+    #[test]
+    fn plan_state_is_not_chat_but_bounded_reminders_are_projected() {
+        let entries = vec![
+            entry(SessionEntryPayload::PlanUpdated(PlanSnapshot {
+                revision: 1,
+                items: vec![PlanItem {
+                    id: "work".into(),
+                    text: "Do the work".into(),
+                    status: PlanStatus::Pending,
+                }],
+                explanation: None,
+            })),
+            entry(SessionEntryPayload::PlanReminder(PlanReminderRecord {
+                revision: 1,
+                reason: PlanReminderReason::Continue,
+            })),
+        ];
+        assert!(application_messages(&entries).is_empty());
+        let projection = project_model_messages(&entries);
+        assert_eq!(projection.messages.len(), 1);
+        assert!(projection.messages[0].text().contains("Plan revision 1"));
     }
 
     #[test]

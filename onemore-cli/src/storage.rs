@@ -4,7 +4,7 @@
 //! - `config.toml` 是所有 workspace 共用的配置；
 //! - `sessions/<uuid>.db` 是一会话一库的 SQLite 事实日志。
 //!
-//! ## 事实日志(schema v3)
+//! ## 事实日志(schema v4)
 //! 数据库不再保存"最终模型消息",而是保存 [`SessionEntry`] 事实:
 //! 每条 entry 有 `id + parent_id + kind + payload`,payload 是厂商无关的
 //! [`SessionEntryPayload`] JSON。模型看到什么由 `session::project_model_messages`
@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::message::{Block, CacheUsage, ChatMessage, Role, Usage};
+use crate::plan::validate_plan_append;
 use crate::session::{
     validate_new_message_batch, MessageRecord, SessionEntry, SessionEntryPayload,
 };
@@ -37,8 +38,10 @@ pub const APP_DIR_NAME: &str = ".onemore";
 
 /// 当前 schema 版本。v1 = 线性 messages 表(无版本号,user_version=0);
 /// v2 = entries 事实日志 + session.leaf_id;
-/// v3 = session cache_read_tokens/cache_write_tokens 累计值。
-const SCHEMA_VERSION: i64 = 3;
+/// v3 = session cache_read_tokens/cache_write_tokens 累计值；
+/// v4 = 严格校验追加式 PlanUpdated facts。
+const SCHEMA_VERSION: i64 = 4;
+const ENTRIES_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -126,10 +129,16 @@ impl WorkspacePreferences {
         self.file.reasoning_efforts.clone()
     }
 
-    /// `medium` 是系统默认值，不写入磁盘；切回 medium 会删除已有覆盖。
-    pub fn set_effort(&mut self, provider: &str, model: &str, effort: &str) -> Result<()> {
+    /// 每个模型的配置默认值不写入磁盘；切回默认值会删除已有覆盖。
+    pub fn set_effort(
+        &mut self,
+        provider: &str,
+        model: &str,
+        effort: &str,
+        default_effort: &str,
+    ) -> Result<()> {
         let mut next = self.file.clone();
-        if effort == crate::config::DEFAULT_REASONING_EFFORT {
+        if effort == default_effort {
             if let Some(models) = next.reasoning_efforts.get_mut(provider) {
                 models.remove(model);
                 if models.is_empty() {
@@ -368,6 +377,10 @@ impl SessionStore {
         }
         // 提交边界的最后防线:带 ToolUse 的消息批必须在本批内配对完整。
         validate_new_message_batch(&payloads).map_err(|reason| anyhow!(reason))?;
+        // 计划事实同样必须从当前合法快照严格推进。并发写者即使在这次读取后
+        // 插入数据，下面事务内的 leaf 一致性校验也会拒绝本批提交。
+        let existing = self.load_entries()?.0;
+        validate_plan_append(&existing, &payloads).map_err(|error| anyhow!(error.message))?;
 
         let now = unix_timestamp();
         let mut parent = self.leaf_id.clone();
@@ -518,7 +531,7 @@ impl SessionStore {
         )?;
         // 只读打开不做迁移;v1 库同样能被列出(按旧 messages 表计数)。
         let version = schema_version(&connection)?;
-        let count_sql = if version >= SCHEMA_VERSION {
+        let count_sql = if version >= ENTRIES_SCHEMA_VERSION {
             "SELECT COUNT(*) FROM entries WHERE kind = 'message'"
         } else {
             "SELECT COUNT(*) FROM messages"
@@ -689,6 +702,7 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::{PlanItem, PlanSnapshot, PlanStatus};
     use crate::session::{NoticeLevel, NoticeRecord};
 
     fn temp_root(name: &str) -> PathBuf {
@@ -705,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_reasoning_preferences_default_to_medium_and_only_store_overrides() {
+    fn workspace_reasoning_preferences_only_store_model_overrides() {
         let root = temp_root("reasoning-preferences");
         let workspaces = root.join("preferences");
         let workspace = root.join("workspace-a");
@@ -715,7 +729,9 @@ mod tests {
 
         let mut preferences = WorkspacePreferences::load(&workspaces, &workspace).unwrap();
         assert_eq!(preferences.effort("openai", "gpt-5"), None);
-        preferences.set_effort("openai", "gpt-5", "high").unwrap();
+        preferences
+            .set_effort("openai", "gpt-5", "high", "low")
+            .unwrap();
         assert!(preferences.path.exists());
 
         let reloaded = WorkspacePreferences::load(&workspaces, &workspace).unwrap();
@@ -724,10 +740,10 @@ mod tests {
         assert_eq!(other.effort("openai", "gpt-5"), None);
 
         preferences
-            .set_effort("openai", "gpt-5", crate::config::DEFAULT_REASONING_EFFORT)
+            .set_effort("openai", "gpt-5", "low", "low")
             .unwrap();
         assert_eq!(preferences.effort("openai", "gpt-5"), None);
-        assert!(!preferences.path.exists(), "切回 medium 应删除空偏好文件");
+        assert!(!preferences.path.exists(), "切回模型默认值应删除空偏好文件");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -890,6 +906,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(appended[0].parent_id, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_facts_are_validated_atomically_at_commit() {
+        let root = temp_root("plan-atomic");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sessions = root.join("sessions");
+        let mut manager = SessionManager::create(sessions.clone(), &workspace).unwrap();
+        let invalid = SessionEntryPayload::PlanUpdated(PlanSnapshot {
+            revision: 2,
+            items: vec![PlanItem {
+                id: "inspect".into(),
+                text: "Inspect the code".into(),
+                status: PlanStatus::InProgress,
+            }],
+            explanation: None,
+        });
+        assert!(manager
+            .append_payloads(
+                vec![
+                    message_payload(ChatMessage::user_text("before")),
+                    invalid,
+                    message_payload(ChatMessage::user_text("after")),
+                ],
+                Usage::default(),
+            )
+            .is_err());
+
+        let valid = SessionEntryPayload::PlanUpdated(PlanSnapshot {
+            revision: 1,
+            items: Vec::new(),
+            explanation: Some("clear".into()),
+        });
+        let appended = manager
+            .append_payloads(vec![valid], Usage::default())
+            .unwrap();
+        assert_eq!(appended.len(), 1, "rejected batch must leave no entries");
+        assert_eq!(
+            appended[0].parent_id, None,
+            "leaf must not advance on failure"
+        );
+
+        let mut reopened = SessionManager::create(sessions, &workspace).unwrap();
+        let (loaded, _) = reopened.load(manager.current_id()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(
+            loaded[0].payload,
+            SessionEntryPayload::PlanUpdated(PlanSnapshot { revision: 1, .. })
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -593,6 +593,13 @@ mod tests {
         let none = ResponsesProvider::new(none_settings).build_body(&prompt, &[]);
         assert_eq!(none["reasoning"]["effort"], "none");
         assert_eq!(none["prompt_cache_key"], omitted["prompt_cache_key"]);
+
+        let mut max_settings = provider().settings;
+        max_settings.selected_effort = "max".into();
+        max_settings.reasoning_effort = ReasoningEffortPolicy::Send("max".into());
+        let max = ResponsesProvider::new(max_settings).build_body(&prompt, &[]);
+        assert_eq!(max["reasoning"]["effort"], "max");
+        assert_eq!(max["prompt_cache_key"], omitted["prompt_cache_key"]);
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::Value;
 
+use crate::plan::PlanSnapshot;
 use crate::util;
 use crate::workspace::Workspace;
 
@@ -15,6 +16,7 @@ mod edit_file;
 mod list_dir;
 mod read_file;
 mod run_command;
+mod update_plan;
 mod write_file;
 
 pub use run_command::{detect_shell, Shell};
@@ -105,7 +107,9 @@ pub struct ToolContext<'a> {
     pub workspace: &'a Workspace,
     pub cancel: &'a AtomicBool,
     pub session_id: &'a str,
+    pub(crate) current_plan: PlanSnapshot,
     pub(crate) progress: &'a mut dyn FnMut(ToolOutput),
+    pub(crate) effects: Vec<ToolEffect>,
 }
 
 impl ToolContext<'_> {
@@ -116,6 +120,23 @@ impl ToolContext<'_> {
             .map(|summary| sanitize_and_bound(&summary));
         (self.progress)(output);
     }
+
+    pub(crate) fn current_plan(&self) -> &PlanSnapshot {
+        &self.current_plan
+    }
+
+    pub(crate) fn record_effect(&mut self, effect: ToolEffect) {
+        self.effects.push(effect);
+    }
+
+    pub(crate) fn take_effects(&mut self) -> Vec<ToolEffect> {
+        std::mem::take(&mut self.effects)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolEffect {
+    PlanUpdated(PlanSnapshot),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -245,6 +266,7 @@ pub struct PreparedToolCall {
 pub struct ToolOutcome {
     pub output: ToolOutput,
     pub error: Option<ToolError>,
+    pub(crate) effects: Vec<ToolEffect>,
 }
 
 impl ToolOutcome {
@@ -252,6 +274,7 @@ impl ToolOutcome {
         ToolOutcome {
             output,
             error: None,
+            effects: Vec::new(),
         }
     }
 
@@ -263,6 +286,7 @@ impl ToolOutcome {
                 details: error.details.clone(),
             },
             error: Some(error),
+            effects: Vec::new(),
         }
     }
 
@@ -495,6 +519,7 @@ pub fn default_registry(shell: Shell) -> ToolRegistry {
         Box::new(write_file::WriteFile),
         Box::new(edit_file::EditFile),
         Box::new(run_command::RunCommand::new(shell)),
+        Box::new(update_plan::UpdatePlan),
     ])
 }
 
@@ -637,7 +662,9 @@ mod tests {
             workspace,
             cancel,
             session_id: "session-1",
+            current_plan: PlanSnapshot::default(),
             progress,
+            effects: Vec::new(),
         }
     }
 

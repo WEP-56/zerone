@@ -4,13 +4,15 @@
 
 - [提示词缓存设计](docs/prompt-cache.md)
 - [API 兼容性与 Chat Completions 删除](docs/api-compatibility.md)
+- [Reasoning effort 配置与 TUI 行为](docs/reason-effort.md)
 - [CacheBoard 测试项目需求书](docs/cacheboard-test-project-cn.md)
 
 Onemore 是从 Zerone 教学基线迁移出的独立 coding agent 工程,并已按
 [project.md](project.md) 的路线完成 1-6 阶段的工程化改造:Provider 终止协议、
 类型化工具管线、权限与 Hook、事实日志与上下文预算、steering/follow-up 队列、
-受控并发与资源锁。Zerone 的目标是"一条数据流容易读懂";Onemore 在保留这条
-数据流的前提下,把目标换成了"每个中断点都有确定的历史、事件、队列和资源状态"。
+受控并发与资源锁、结构化计划与长任务纪律。Zerone 的目标是"一条数据流容易读懂";
+Onemore 在保留这条数据流的前提下,把目标换成了"每个中断点都有确定的历史、
+事件、队列和资源状态"。
 
 ## 运行
 
@@ -88,9 +90,10 @@ Zerone 是刻意压低复杂度的可运行基线;Onemore 在同一架构骨架�
 
 - Zerone:屏幕历史 = 运行历史 = 持久历史 = 模型上下文,四者是同一个
   `Vec<ChatMessage>` 全量发送;SQLite 只存最终模型消息。
-- Onemore:持久层是 append-only 的事实日志(schema v3):
+- Onemore:持久层是 append-only 的事实日志(schema v4):
   `SessionEntry { id, parent_id, kind, payload }`,payload 分
-  `Message(含该次真实 usage) / Notice / Compaction / ModelChange / Artifact`。
+  `Message(含该次真实 usage) / Notice / Compaction / ModelChange / Artifact /
+  PlanUpdated / PlanReminder`。
   entry、链尾(leaf)与统计在同一事务提交;带 ToolUse 的消息批在提交边界
   被强制配对完整,提交失败则内存镜像不推进、本轮立即终止——内存与磁盘
   永不分叉。旧版线性库在打开时单事务自动迁移,失败回滚保留原库。
@@ -123,9 +126,21 @@ Zerone 是刻意压低复杂度的可运行基线;Onemore 在同一架构骨架�
 - 可配置单工具超时(`[agent] tool_timeout_secs`):逾期置组合取消标志,
   因此中止的结果报 `timeout`;工具无视标志坚持完成的保留真实结果。
 
-### 尚未实现(对应路线阶段 7-8)
+### 7. 结构化计划与长任务纪律
 
-Todo/Skills/Task 系统、Background 命令、子代理、MCP、树形会话的 move/fork、
+- 固定 `update_plan` 工具使用完整快照与 `expected_revision` CAS；条目有稳定 ID、
+  `pending / in_progress / completed` 三种状态，运行时强制最多一个 `in_progress`，
+  并限制条目数与文本长度。过期 revision 和非法快照不会落库。
+- 工具通过独立 harness effect 返回状态变化；`ToolUse + PlanUpdated + ToolResult`
+  在同一 SQLite 事务提交，`ToolCallFinished` 与 `PlanUpdated` 事件只在成功后发出。
+- TUI/headless 显示真实快照；恢复由 facts reducer 重建。压缩只携带活动项和完成
+  计数。取消把 `in_progress` 退回 `pending` 并追加新 revision，不伪造完成。
+- 模型准备结束但计划仍有活动项时，Runtime 最多追加一次继续提醒；之后允许结束，
+  不会形成无限 completion gate。steering/follow-up 的优先级高于自动提醒。
+
+### 尚未实现
+
+Skills、MCP、持久 Background/Task 系统、子代理、树形会话的 move/fork、
 自动触发的 compaction(当前需手动 `/compact`)。
 
 ## 配置增量
@@ -149,14 +164,15 @@ default_model = "gpt-5"
 [providers.xxx.models."gpt-5"]
 context_window = 400000        # 每个模型独立配置上下文窗口
 max_tokens = 128000
-
-[providers.xxx.models."gpt-5".reasoning]
-send_effort = true             # false 或省略此 table 时不发送 effort 字段
-efforts = ["none", "low", "medium", "high"]
+# 省略 efforts 时使用 profile 标准列表；非空数组完整覆盖；空数组不发送 effort。
+efforts = ["low", "high", "max"]
+# 可选；省略时优先 medium，不存在则用 efforts 第一项。
+default_effort = "high"
 ```
 
-思考程度默认始终为 `medium`。非 `medium` 选择按 workspace/provider/model 保存；
-新 workspace、新模型以及切回默认值时都使用 `medium`。
+`profile = "openai"` 的标准列表是 `none/minimal/low/medium/high/xhigh/max`；
+`profile = "anthropic"` 是 `low/medium/high/xhigh/max`。模型选择按
+workspace/provider/model 保存；切回该模型的 `default_effort` 时删除偏好覆盖。
 
 ## 存储
 
@@ -164,9 +180,9 @@ efforts = ["none", "low", "medium", "high"]
 ~/.onemore/
   config.toml
   sessions/
-    <session-id>.db            # schema v3:事实日志 + token/cache 累计用量
+    <session-id>.db            # schema v4:事实日志 + 严格计划 reducer + token/cache 用量
   workspaces/
-    <workspace-hash>.json      # 仅保存偏离 medium 的模型思考程度
+    <workspace-hash>.json      # 仅保存偏离各模型 default_effort 的思考程度
 ```
 
 Onemore 不读取 `~/.zerone`,也不识别 `ZERONE_HOME`,因此两个程序的配置、密钥和会话
@@ -179,7 +195,7 @@ messages 表)数据库在打开时自动迁移到当前 schema,迁移失败回�
 
 ```powershell
 .\scripts\package-npm.ps1 -Pack
-npm install --global .\dist\npm\onemore-agent-0.3.0.tgz
+npm install --global .\dist\npm\onemore-agent-0.4.0.tgz
 onemore --help
 ```
 
@@ -189,7 +205,7 @@ onemore --help
 
 ```powershell
 cargo fmt --check
-cargo test --locked          # 115 单测 + 5 wire 测试
+cargo test --locked          # 140 单测 + 5 wire 测试
 cargo build --release --locked
 .\scripts\package-npm.ps1 -Pack
 ```

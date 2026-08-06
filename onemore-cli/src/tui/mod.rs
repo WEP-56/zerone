@@ -47,6 +47,7 @@ use crate::config::{
 use crate::event::{AgentCommand, AgentEvent};
 use crate::message::{Block as MessageBlock, ChatMessage, Role, Usage};
 use crate::permission::{ApprovalDecision, ApprovalRequest, ApprovalResponse, ApprovalScope};
+use crate::plan::reduce_plan;
 use crate::runtime::RuntimeHandle;
 use crate::session::{SessionEntry, SessionEntryPayload};
 use crate::util;
@@ -331,6 +332,11 @@ impl App {
                 self.transcript
                     .finish_tool(&id, output.ui_text().to_string(), error.is_some());
             }
+            AgentEvent::PlanUpdated {
+                revision,
+                items,
+                explanation,
+            } => self.transcript.push_plan(revision, items, explanation),
             AgentEvent::PermissionRequested { request } => {
                 self.status_note = format!("等待审批: {}", request.tool);
                 self.overlay = Some(Overlay::Approval {
@@ -383,13 +389,20 @@ impl App {
                 effort,
                 label,
             } => {
+                let default_effort = self
+                    .provider_catalog
+                    .iter()
+                    .find(|entry| entry.name == provider)
+                    .and_then(|entry| entry.models.iter().find(|entry| entry.id == model))
+                    .map(|entry| entry.default_effort.clone())
+                    .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string());
                 self.provider_label = label;
                 self.active_selection = ActiveModelSelection {
                     provider: provider.clone(),
                     model: model.clone(),
                     effort: effort.clone(),
                 };
-                if effort == DEFAULT_REASONING_EFFORT {
+                if effort == default_effort {
                     if let Some(models) = self.reasoning_preferences.get_mut(&provider) {
                         models.remove(&model);
                         if models.is_empty() {
@@ -482,6 +495,7 @@ impl App {
     /// 按事实日志重建画面:Message 还原对话与工具单元,
     /// Notice/Compaction/ModelChange 等 UI-only 事实以提示行呈现。
     fn restore_transcript(&mut self, entries: &[SessionEntry]) {
+        let plan = reduce_plan(entries);
         let results: HashMap<&str, (&str, bool)> = entries
             .iter()
             .filter_map(|entry| match &entry.payload {
@@ -518,8 +532,21 @@ impl App {
                     self.transcript
                         .push_notice(format!("模型切换: {}", change.provider));
                 }
-                SessionEntryPayload::Artifact(_) => {}
+                SessionEntryPayload::Artifact(_)
+                | SessionEntryPayload::PlanUpdated(_)
+                | SessionEntryPayload::PlanReminder(_) => {}
             }
+        }
+        if plan.snapshot.revision > 0 {
+            self.transcript.push_plan(
+                plan.snapshot.revision,
+                plan.snapshot.items,
+                plan.snapshot.explanation,
+            );
+        }
+        for diagnostic in plan.diagnostics {
+            self.transcript
+                .push_notice(format!("计划事实修复: {diagnostic}"));
         }
     }
 
@@ -1108,7 +1135,7 @@ impl App {
         } else {
             self.saved_effort(&model_id)
                 .filter(|saved| model.efforts.iter().any(|effort| effort == saved))
-                .unwrap_or(DEFAULT_REASONING_EFFORT)
+                .unwrap_or(&model.default_effort)
                 .to_string()
         };
         let items = model
@@ -1603,13 +1630,15 @@ mod tests {
                             context_window: Some(100_000),
                             max_tokens: Some(8_000),
                             efforts: vec!["low".into(), "medium".into(), "high".into()],
+                            default_effort: "medium".into(),
                             sends_effort: true,
                         },
                         ModelCatalogEntry {
                             id: "other-model".into(),
                             context_window: Some(50_000),
                             max_tokens: Some(4_000),
-                            efforts: vec!["medium".into(), "high".into()],
+                            efforts: vec!["low".into(), "high".into(), "max".into()],
+                            default_effort: "low".into(),
                             sends_effort: true,
                         },
                     ],
@@ -1622,6 +1651,7 @@ mod tests {
                         context_window: Some(32_000),
                         max_tokens: None,
                         efforts: vec!["medium".into()],
+                        default_effort: "medium".into(),
                         sends_effort: false,
                     }],
                 },
@@ -1872,6 +1902,24 @@ mod tests {
                 ..
             })
         ));
+        let Some(Overlay::Picker { picker, .. }) = &app.overlay else {
+            unreachable!();
+        };
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|item| (item.label.as_str(), item.current))
+                .collect::<Vec<_>>(),
+            vec![("low", false), ("high", true), ("max", false)]
+        );
+        let mut terminal = Terminal::new(TestBackend::new(72, 16)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("low"));
+        assert!(rendered.contains("high"));
+        assert!(rendered.contains("max"));
+        assert!(!rendered.contains("medium"));
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
         match cmd.try_recv() {
             Ok(AgentCommand::SelectModel { model, effort }) => {
@@ -1880,6 +1928,19 @@ mod tests {
             }
             other => panic!("应收到原子 SelectModel,得到 {:?}", other),
         }
+    }
+
+    #[test]
+    fn model_default_effort_clears_the_workspace_override() {
+        let (mut app, _evt, _cmd, _approvals) = dummy_app();
+        assert_eq!(app.saved_effort("other-model"), Some("high"));
+        app.on_agent_event(AgentEvent::ModelSelectionChanged {
+            provider: "mock".into(),
+            model: "other-model".into(),
+            effort: "low".into(),
+            label: "mock / other-model / effort=low".into(),
+        });
+        assert_eq!(app.saved_effort("other-model"), None);
     }
 
     #[test]

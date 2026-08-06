@@ -143,7 +143,9 @@ mod tests {
                 workspace: &ws,
                 cancel: &cancel,
                 session_id: "test",
+                current_plan: crate::plan::PlanSnapshot::default(),
                 progress: &mut |_| {},
+                effects: Vec::new(),
             },
         )
     }

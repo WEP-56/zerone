@@ -527,7 +527,9 @@ mod tests {
                 workspace: &workspace,
                 cancel: &cancel,
                 session_id: "test",
+                current_plan: crate::plan::PlanSnapshot::default(),
                 progress: &mut |_| {},
+                effects: Vec::new(),
             },
         )
     }
@@ -582,7 +584,9 @@ mod tests {
                     workspace: &workspace,
                     cancel: &cancel,
                     session_id: "test",
+                    current_plan: crate::plan::PlanSnapshot::default(),
                     progress: &mut progress,
+                    effects: Vec::new(),
                 },
             )
         };

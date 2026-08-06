@@ -241,7 +241,11 @@ impl HookRegistry {
             };
             match hook.post_tool_use(&ctx) {
                 Ok(PostToolUseHookResult::Continue) => {}
-                Ok(PostToolUseHookResult::ReplaceOutcome(outcome)) => {
+                Ok(PostToolUseHookResult::ReplaceOutcome(mut outcome)) => {
+                    // Harness-owned effects describe state already produced by the tool. A post
+                    // hook may redact/replace the observation, but it must not forge or erase the
+                    // state transition that will be validated and committed by Runtime.
+                    outcome.effects = std::mem::take(&mut pipeline.outcome.effects);
                     pipeline.outcome = outcome;
                 }
                 Ok(PostToolUseHookResult::StopAfterCommit(reason)) => {

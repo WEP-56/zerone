@@ -63,6 +63,7 @@ pub struct ModelCatalogEntry {
     pub context_window: Option<u64>,
     pub max_tokens: Option<u64>,
     pub efforts: Vec<String>,
+    pub default_effort: String,
     pub sends_effort: bool,
 }
 
@@ -93,6 +94,16 @@ impl ProviderProfile {
             bail!("provider profile 与 api 类型不匹配");
         }
         Ok(profile)
+    }
+
+    fn standard_efforts(self) -> Option<&'static [&'static str]> {
+        match self {
+            ProviderProfile::OpenAiResponses => {
+                Some(&["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+            }
+            ProviderProfile::AnthropicMessages => Some(&["low", "medium", "high", "xhigh", "max"]),
+            ProviderProfile::DeepSeekResponses | ProviderProfile::DeepSeekMessages => None,
+        }
     }
 }
 
@@ -133,6 +144,7 @@ pub struct ProviderSettings {
 // ---- config.toml 的原始形状(serde 直接映射) ----
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     agent: AgentSection,
     #[serde(default)]
@@ -142,6 +154,7 @@ struct FileConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct PermissionsSection {
     #[serde(default)]
     workspace_read: Option<String>,
@@ -154,6 +167,7 @@ struct PermissionsSection {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentSection {
     provider: String,
     #[serde(default)]
@@ -167,6 +181,7 @@ struct AgentSection {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct RawProviderSection {
     api: String,
     #[serde(default)]
@@ -188,19 +203,15 @@ struct RawProviderSection {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct RawModelSection {
     context_window: u64,
     #[serde(default)]
     max_tokens: Option<u64>,
     #[serde(default)]
-    reasoning: Option<RawReasoningSection>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct RawReasoningSection {
-    send_effort: bool,
+    efforts: Option<Vec<String>>,
     #[serde(default)]
-    efforts: Vec<String>,
+    default_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,14 +235,24 @@ struct ModelSection {
 #[derive(Debug, Clone)]
 enum ModelReasoning {
     Omit,
-    Send(Vec<String>),
+    Send {
+        efforts: Vec<String>,
+        default_effort: String,
+    },
 }
 
 impl ModelReasoning {
     fn efforts(&self) -> Vec<String> {
         match self {
             ModelReasoning::Omit => vec![DEFAULT_REASONING_EFFORT.to_string()],
-            ModelReasoning::Send(efforts) => efforts.clone(),
+            ModelReasoning::Send { efforts, .. } => efforts.clone(),
+        }
+    }
+
+    fn default_effort(&self) -> &str {
+        match self {
+            ModelReasoning::Omit => DEFAULT_REASONING_EFFORT,
+            ModelReasoning::Send { default_effort, .. } => default_effort,
         }
     }
 
@@ -244,10 +265,10 @@ impl ModelReasoning {
                 "该模型未配置可发送的 reasoning effort,只能使用 {}",
                 DEFAULT_REASONING_EFFORT
             ),
-            ModelReasoning::Send(efforts) if efforts.iter().any(|item| item == effort) => {
+            ModelReasoning::Send { efforts, .. } if efforts.iter().any(|item| item == effort) => {
                 Ok(ReasoningEffortPolicy::Send(effort.to_string()))
             }
-            ModelReasoning::Send(efforts) => bail!(
+            ModelReasoning::Send { efforts, .. } => bail!(
                 "未知 reasoning effort {:?},可选: {}",
                 effort,
                 efforts.join(", ")
@@ -317,11 +338,22 @@ impl Config {
                 "commands",
             )?,
         };
+        let shell = raw.agent.shell.unwrap_or_else(|| "auto".into());
+        if !matches!(shell.as_str(), "auto" | "gitbash" | "powershell" | "cmd") {
+            bail!(
+                "[agent].shell = {:?} 无效,可选: auto | gitbash | powershell | cmd",
+                shell
+            );
+        }
+        let max_turns = raw.agent.max_turns.unwrap_or(50);
+        if max_turns == 0 {
+            bail!("[agent].max_turns 必须大于 0");
+        }
         Ok(Config {
             active_provider: raw.agent.provider,
-            shell: raw.agent.shell.unwrap_or_else(|| "auto".into()),
+            shell,
             system_prompt: raw.agent.system_prompt,
-            max_turns: raw.agent.max_turns.unwrap_or(50).max(1),
+            max_turns,
             tool_timeout: raw
                 .agent
                 .tool_timeout_secs
@@ -350,7 +382,8 @@ impl Config {
                         context_window: model.context_window,
                         max_tokens: model.max_tokens,
                         efforts: model.reasoning.efforts(),
-                        sends_effort: matches!(model.reasoning, ModelReasoning::Send(_)),
+                        default_effort: model.reasoning.default_effort().to_string(),
+                        sends_effort: matches!(model.reasoning, ModelReasoning::Send { .. }),
                     })
                     .collect(),
             })
@@ -359,11 +392,24 @@ impl Config {
 
     pub fn default_selection(&self, provider: &str) -> Result<ActiveModelSelection> {
         let section = self.provider(provider)?;
+        let model = section
+            .models
+            .get(&section.default_model)
+            .expect("normalized provider must contain its default model");
         Ok(ActiveModelSelection {
             provider: provider.to_string(),
             model: section.default_model.clone(),
-            effort: DEFAULT_REASONING_EFFORT.to_string(),
+            effort: model.reasoning.default_effort().to_string(),
         })
+    }
+
+    pub fn model_default_effort(&self, provider: &str, model: &str) -> Result<&str> {
+        let section = self.provider(provider)?;
+        section
+            .models
+            .get(model)
+            .map(|model| model.reasoning.default_effort())
+            .ok_or_else(|| anyhow!("provider {:?} 没有模型 {:?}", provider, model))
     }
 
     /// 把某个 provider 的默认模型解析成可用设置(含 key 查找)。
@@ -439,6 +485,29 @@ impl Config {
 }
 
 fn normalize_provider(name: &str, raw: RawProviderSection) -> Result<ProviderSection> {
+    if name.trim().is_empty() {
+        bail!("provider 名称不能为空");
+    }
+    let base_url = raw.base_url.trim().to_string();
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        bail!(
+            "[providers.{}].base_url 必须是 http:// 或 https:// URL",
+            name
+        );
+    }
+    if raw.api_key.is_some() && raw.api_key_env.is_some() {
+        bail!(
+            "[providers.{}] 只能配置 api_key 或 api_key_env 其中一个",
+            name
+        );
+    }
+    if raw
+        .api_key_env
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
+        bail!("[providers.{}].api_key_env 不能为空", name);
+    }
     let api = ApiKind::parse(&raw.api).with_context(|| format!("[providers.{}].api 无效", name))?;
     let profile = ProviderProfile::parse(raw.profile.as_deref(), api)
         .with_context(|| format!("[providers.{}].profile 无效", name))?;
@@ -463,6 +532,9 @@ fn normalize_provider(name: &str, raw: RawProviderSection) -> Result<ProviderSec
             .models
             .into_iter()
             .map(|(model_id, model)| {
+                if model_id.trim().is_empty() {
+                    bail!("[providers.{}].models 含空模型 ID", name);
+                }
                 normalize_model(name, &model_id, profile, model).map(|model| (model_id, model))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
@@ -485,7 +557,7 @@ fn normalize_provider(name: &str, raw: RawProviderSection) -> Result<ProviderSec
             ModelSection {
                 context_window: raw.context_window,
                 max_tokens: raw.max_tokens,
-                reasoning: ModelReasoning::Omit,
+                reasoning: normalize_model_reasoning(name, &model, profile, None, None)?,
             },
         );
         (model, models)
@@ -494,11 +566,11 @@ fn normalize_provider(name: &str, raw: RawProviderSection) -> Result<ProviderSec
     Ok(ProviderSection {
         api,
         profile,
-        base_url: raw.base_url,
+        base_url,
         default_model,
         models,
         api_key: raw.api_key,
-        api_key_env: raw.api_key_env,
+        api_key_env: raw.api_key_env.map(|name| name.trim().to_string()),
     })
 }
 
@@ -510,68 +582,107 @@ fn normalize_model(
 ) -> Result<ModelSection> {
     let context_window = Some(raw.context_window);
     validate_model_limits(provider_name, model_id, context_window, raw.max_tokens)?;
-    let reasoning = match raw.reasoning {
-        None => ModelReasoning::Omit,
-        Some(reasoning) if !reasoning.send_effort => {
-            if !reasoning.efforts.is_empty() {
-                bail!(
-                    "[providers.{}.models.{:?}.reasoning] send_effort=false 时不能配置 efforts",
-                    provider_name,
-                    model_id
-                );
-            }
-            ModelReasoning::Omit
-        }
-        Some(reasoning) => {
-            if !matches!(
-                profile,
-                ProviderProfile::OpenAiResponses | ProviderProfile::AnthropicMessages
-            ) {
-                bail!(
-                    "[providers.{}.models.{:?}.reasoning] profile {:?} 尚不支持发送 effort",
-                    provider_name,
-                    model_id,
-                    profile
-                );
-            }
-            let mut efforts = Vec::with_capacity(reasoning.efforts.len());
-            for effort in reasoning.efforts {
-                let effort = effort.trim().to_string();
-                if effort.is_empty() || effort.chars().count() > 64 {
-                    bail!(
-                        "[providers.{}.models.{:?}.reasoning].efforts 含空值或超过 64 字符",
-                        provider_name,
-                        model_id
-                    );
-                }
-                if efforts.iter().any(|existing| existing == &effort) {
-                    bail!(
-                        "[providers.{}.models.{:?}.reasoning].efforts 重复: {:?}",
-                        provider_name,
-                        model_id,
-                        effort
-                    );
-                }
-                efforts.push(effort);
-            }
-            if !efforts
-                .iter()
-                .any(|effort| effort == DEFAULT_REASONING_EFFORT)
-            {
-                bail!(
-                    "[providers.{}.models.{:?}.reasoning].efforts 必须包含默认值 {:?}",
-                    provider_name,
-                    model_id,
-                    DEFAULT_REASONING_EFFORT
-                );
-            }
-            ModelReasoning::Send(efforts)
-        }
-    };
+    let reasoning = normalize_model_reasoning(
+        provider_name,
+        model_id,
+        profile,
+        raw.efforts,
+        raw.default_effort,
+    )?;
     Ok(ModelSection {
         context_window,
         max_tokens: raw.max_tokens,
         reasoning,
+    })
+}
+
+fn normalize_model_reasoning(
+    provider_name: &str,
+    model_id: &str,
+    profile: ProviderProfile,
+    configured_efforts: Option<Vec<String>>,
+    configured_default: Option<String>,
+) -> Result<ModelReasoning> {
+    let Some(standard_efforts) = profile.standard_efforts() else {
+        if configured_efforts.is_some() || configured_default.is_some() {
+            bail!(
+                "[providers.{}.models.{:?}] profile {:?} 不支持配置 efforts/default_effort",
+                provider_name,
+                model_id,
+                profile
+            );
+        }
+        return Ok(ModelReasoning::Omit);
+    };
+
+    let mut efforts = match configured_efforts {
+        Some(efforts) => efforts,
+        None => standard_efforts
+            .iter()
+            .map(|effort| (*effort).to_string())
+            .collect(),
+    };
+    if efforts.is_empty() {
+        if configured_default.is_some() {
+            bail!(
+                "[providers.{}.models.{:?}] efforts=[] 时不能配置 default_effort",
+                provider_name,
+                model_id
+            );
+        }
+        return Ok(ModelReasoning::Omit);
+    }
+    for effort in &mut efforts {
+        *effort = effort.trim().to_string();
+        if effort.is_empty() || effort.chars().count() > 64 {
+            bail!(
+                "[providers.{}.models.{:?}].efforts 含空值或超过 64 字符",
+                provider_name,
+                model_id
+            );
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for effort in &efforts {
+        if !seen.insert(effort.as_str()) {
+            bail!(
+                "[providers.{}.models.{:?}].efforts 重复: {:?}",
+                provider_name,
+                model_id,
+                effort
+            );
+        }
+    }
+
+    let default_effort = match configured_default {
+        Some(default) => {
+            let default = default.trim().to_string();
+            if default.is_empty() || default.chars().count() > 64 {
+                bail!(
+                    "[providers.{}.models.{:?}].default_effort 不能为空或超过 64 字符",
+                    provider_name,
+                    model_id
+                );
+            }
+            default
+        }
+        None => efforts
+            .iter()
+            .find(|effort| effort.as_str() == DEFAULT_REASONING_EFFORT)
+            .unwrap_or(&efforts[0])
+            .clone(),
+    };
+    if !efforts.iter().any(|effort| effort == &default_effort) {
+        bail!(
+            "[providers.{}.models.{:?}].default_effort {:?} 不在 efforts 中",
+            provider_name,
+            model_id,
+            default_effort
+        );
+    }
+    Ok(ModelReasoning::Send {
+        efforts,
+        default_effort,
     })
 }
 
@@ -630,6 +741,8 @@ provider = "anthropic"
 shell = "auto"
 # 一轮对话里最多连续调用模型的次数(防止失控空转)
 max_turns = 50
+# 可选：单个工具调用超时秒数；省略或 0 表示不限制。
+# tool_timeout_secs = 300
 # 想完全接管系统提示就取消下面的注释:
 # system_prompt = "You are ..."
 
@@ -652,16 +765,18 @@ default_model = "claude-sonnet-5"
 [providers.anthropic.models."claude-sonnet-5"]
 context_window = 200000
 max_tokens = 32000
-
-[providers.anthropic.models."claude-sonnet-5".reasoning]
-send_effort = true
-efforts = ["low", "medium", "high"]
+# 省略 efforts：按 profile="anthropic" 使用标准列表
+# low | medium | high | xhigh | max，默认 medium。
 
 [providers.anthropic.models."claude-opus-5"]
 context_window = 200000
 max_tokens = 32000
+# 模型不支持 effort 时显式写空数组；TUI 只显示 medium，请求不发送 effort。
+efforts = []
 
 # ---- OpenAI Responses API(OpenAI 当前主推)----
+# profile 决定请求字段和流事件语义，不要求模型名称必须是 OpenAI 品牌；
+# 接受 OpenAI Responses reasoning 字段的兼容网关也应使用 profile="openai"。
 [providers.openai]
 api = "responses"
 profile = "openai"
@@ -672,18 +787,16 @@ default_model = "gpt-5"
 [providers.openai.models."gpt-5"]
 context_window = 400000
 max_tokens = 128000
-
-[providers.openai.models."gpt-5".reasoning]
-send_effort = true
-efforts = ["none", "low", "medium", "high"]
+# 省略 efforts：按 profile="openai" 使用标准列表
+# none | minimal | low | medium | high | xhigh | max，默认 medium。
 
 [providers.openai.models."gpt-5-pro"]
 context_window = 400000
 max_tokens = 128000
-
-[providers.openai.models."gpt-5-pro".reasoning]
-send_effort = true
-efforts = ["low", "medium", "high", "xhigh"]
+# 非空数组完整覆盖 profile 标准列表；不要求包含 medium。
+efforts = ["low", "high", "max"]
+# 可选；省略时优先选 medium，不存在 medium 则选数组第一项。
+default_effort = "high"
 
 # ---- DeepSeek Responses API ----
 [providers.deepseek]
@@ -696,7 +809,8 @@ default_model = "deepseek-v4-flash"
 [providers.deepseek.models."deepseek-v4-flash"]
 context_window = 131072
 max_tokens = 8192
-# 没有 reasoning table：TUI 默认 medium，请求不发送 effort 字段。
+# deepseek-* profile 不定义标准 effort，也不允许配置 efforts；
+# TUI 默认 medium，请求不发送 effort 字段。
 "#;
 
 #[cfg(test)]
@@ -770,14 +884,13 @@ default_model = "gpt.main/v1"
 [providers.mock.models."gpt.main/v1"]
 context_window = 400000
 max_tokens = 128000
-
-[providers.mock.models."gpt.main/v1".reasoning]
-send_effort = true
 efforts = ["none", "medium", "vendor_ultra"]
+default_effort = "vendor_ultra"
 
 [providers.mock.models."small:model"]
 context_window = 64000
 max_tokens = 8000
+efforts = []
 "#,
         )
         .unwrap();
@@ -794,6 +907,12 @@ max_tokens = 8000
         assert_eq!(main.context_window, Some(400000));
         assert_eq!(main.max_tokens, Some(128000));
         assert_eq!(main.efforts, ["none", "medium", "vendor_ultra"]);
+        assert_eq!(main.default_effort, "vendor_ultra");
+        assert!(main.sends_effort);
+        assert_eq!(
+            config.default_selection("mock").unwrap().effort,
+            "vendor_ultra"
+        );
 
         let settings = config
             .resolve_selection(&ActiveModelSelection {
@@ -839,11 +958,18 @@ max_tokens = 4096
         let settings = config.resolve_provider("legacy").unwrap();
         assert_eq!(settings.model, "old-model");
         assert_eq!(settings.context_window, Some(32000));
-        assert_eq!(settings.reasoning_effort, ReasoningEffortPolicy::Omit);
+        assert_eq!(
+            settings.reasoning_effort,
+            ReasoningEffortPolicy::Send("medium".into())
+        );
+        assert_eq!(
+            config.provider_catalog()[0].models[0].efforts,
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
     }
 
     #[test]
-    fn rejects_mixed_formats_and_reasoning_without_medium() {
+    fn rejects_mixed_formats_and_unknown_reasoning_fields() {
         let mixed = r#"
 [agent]
 provider = "mock"
@@ -858,7 +984,7 @@ context_window = 32000
 "#;
         assert!(format!("{:#}", load_config(mixed).unwrap_err()).contains("不能混用"));
 
-        let no_medium = r#"
+        let removed_send_effort = r#"
 [agent]
 provider = "mock"
 [providers.mock]
@@ -868,10 +994,107 @@ api_key = ""
 default_model = "new"
 [providers.mock.models.new]
 context_window = 32000
-[providers.mock.models.new.reasoning]
 send_effort = true
 efforts = ["low", "high"]
 "#;
-        assert!(format!("{:#}", load_config(no_medium).unwrap_err()).contains("必须包含默认值"));
+        assert!(
+            format!("{:#}", load_config(removed_send_effort).unwrap_err()).contains("send_effort")
+        );
+    }
+
+    #[test]
+    fn profile_defaults_and_custom_efforts_do_not_require_medium() {
+        let config = load_config(
+            r#"
+[agent]
+provider = "openai"
+
+[providers.openai]
+api = "responses"
+profile = "openai"
+base_url = "https://example.invalid/v1"
+api_key = ""
+default_model = "custom"
+
+[providers.openai.models.custom]
+context_window = 400000
+efforts = ["low", "high", "max"]
+
+[providers.anthropic]
+api = "messages"
+profile = "anthropic"
+base_url = "https://example.invalid"
+api_key = ""
+default_model = "standard"
+
+[providers.anthropic.models.standard]
+context_window = 200000
+"#,
+        )
+        .unwrap();
+
+        let catalog = config.provider_catalog();
+        let openai = catalog
+            .iter()
+            .find(|provider| provider.name == "openai")
+            .unwrap();
+        assert_eq!(openai.models[0].efforts, ["low", "high", "max"]);
+        assert_eq!(openai.models[0].default_effort, "low");
+        assert_eq!(config.default_selection("openai").unwrap().effort, "low");
+        assert_eq!(
+            config
+                .resolve_selection(&ActiveModelSelection {
+                    provider: "openai".into(),
+                    model: "custom".into(),
+                    effort: "max".into(),
+                })
+                .unwrap()
+                .reasoning_effort,
+            ReasoningEffortPolicy::Send("max".into())
+        );
+        let anthropic = catalog
+            .iter()
+            .find(|provider| provider.name == "anthropic")
+            .unwrap();
+        assert_eq!(
+            anthropic.models[0].efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(anthropic.models[0].default_effort, "medium");
+    }
+
+    #[test]
+    fn rejects_unsafe_or_ambiguous_basic_configuration() {
+        let invalid_shell = r#"
+[agent]
+provider = "mock"
+shell = "bash"
+[providers.mock]
+api = "responses"
+base_url = "https://example.invalid/v1"
+api_key = ""
+model = "model"
+context_window = 32000
+"#;
+        assert!(format!("{:#}", load_config(invalid_shell).unwrap_err()).contains("shell"));
+
+        let zero_turns = invalid_shell.replace("shell = \"bash\"", "max_turns = 0");
+        assert!(format!("{:#}", load_config(&zero_turns).unwrap_err()).contains("max_turns"));
+
+        let duplicate_key_sources = r#"
+[agent]
+provider = "mock"
+[providers.mock]
+api = "responses"
+base_url = "https://example.invalid/v1"
+api_key = ""
+api_key_env = "OPENAI_API_KEY"
+model = "model"
+context_window = 32000
+"#;
+        assert!(
+            format!("{:#}", load_config(duplicate_key_sources).unwrap_err())
+                .contains("只能配置 api_key 或 api_key_env")
+        );
     }
 }

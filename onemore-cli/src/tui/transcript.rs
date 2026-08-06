@@ -9,6 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use textwrap::Options;
 
+use crate::plan::{PlanItem, PlanStatus};
 use crate::util;
 
 /// 工具输出在聊天区最多显示的视觉行数(完整内容始终在消息历史里)。
@@ -32,6 +33,11 @@ pub enum Cell {
         summary: String,
         output: Option<String>,
         is_error: bool,
+    },
+    Plan {
+        revision: u64,
+        items: Vec<PlanItem>,
+        explanation: Option<String>,
     },
     Notice(String),
     Error(String),
@@ -118,6 +124,15 @@ impl Transcript {
 
     pub fn push_error(&mut self, text: String) {
         self.entries.push(Entry::new(Cell::Error(text)));
+        self.invalidate_layout();
+    }
+
+    pub fn push_plan(&mut self, revision: u64, items: Vec<PlanItem>, explanation: Option<String>) {
+        self.entries.push(Entry::new(Cell::Plan {
+            revision,
+            items,
+            explanation,
+        }));
         self.invalidate_layout();
     }
 
@@ -314,7 +329,7 @@ impl Transcript {
 
 fn cell_is_finalized(cell: &Cell) -> bool {
     match cell {
-        Cell::User(_) | Cell::Notice(_) | Cell::Error(_) => true,
+        Cell::User(_) | Cell::Plan { .. } | Cell::Notice(_) | Cell::Error(_) => true,
         Cell::Assistant { open, .. } | Cell::Thinking { open, .. } => !open,
         Cell::Tool { output, .. } => output.is_some(),
     }
@@ -432,6 +447,45 @@ fn build_lines(cell: &Cell, width: u16) -> Vec<Line<'static>> {
             }
             v
         }
+        Cell::Plan {
+            revision,
+            items,
+            explanation,
+        } => {
+            let mut lines = vec![Line::styled(
+                if items.is_empty() {
+                    format!("计划 #{} 已清空", revision)
+                } else {
+                    format!("计划 #{}", revision)
+                },
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            if let Some(explanation) = explanation {
+                lines.extend(wrap_styled(explanation, w, "  ", "  ", style_dim()));
+            }
+            for item in items {
+                let (marker, style) = match item.status {
+                    PlanStatus::Pending => ("[ ]", Style::default()),
+                    PlanStatus::InProgress => (
+                        "[>]",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    PlanStatus::Completed => ("[x]", style_dim()),
+                };
+                lines.extend(wrap_styled(
+                    &format!("{}: {}", item.id, item.text),
+                    w,
+                    &format!("  {} ", marker),
+                    "      ",
+                    style,
+                ));
+            }
+            lines
+        }
         Cell::Notice(t) => wrap_styled(t, w, "· ", "  ", style_dim()),
         Cell::Error(t) => wrap_styled(t, w, "✖ ", "  ", Style::default().fg(Color::Red)),
     };
@@ -505,5 +559,34 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("完成。提交信息"));
         assert!(!text.contains("完 成"));
+    }
+
+    #[test]
+    fn plan_cell_renders_true_statuses_and_clear_state() {
+        let mut transcript = Transcript::default();
+        transcript.push_plan(
+            3,
+            vec![
+                PlanItem {
+                    id: "active".into(),
+                    text: "正在处理".into(),
+                    status: PlanStatus::InProgress,
+                },
+                PlanItem {
+                    id: "later".into(),
+                    text: "稍后处理".into(),
+                    status: PlanStatus::Pending,
+                },
+            ],
+            None,
+        );
+        transcript.push_plan(4, Vec::new(), None);
+
+        let rendered = format!("{:?}", transcript.drain_finalized_lines(60));
+        assert!(rendered.contains("计划 #3"));
+        assert!(rendered.contains("[>] active"));
+        assert!(rendered.contains("[ ] later"));
+        assert!(rendered.contains("计划 #4 已清空"));
+        assert!(!rendered.contains("[x] active"));
     }
 }

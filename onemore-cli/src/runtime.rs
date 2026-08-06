@@ -30,7 +30,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{ActiveModelSelection, Config, ProviderCatalogEntry, DEFAULT_REASONING_EFFORT};
+use crate::config::{ActiveModelSelection, Config, ProviderCatalogEntry};
 use crate::context::budget::{apply_budget, estimate_tokens, BudgetDecision, ContextBudget};
 use crate::context::instructions::Instructions;
 use crate::context::workspace_info::WorkspaceInfo;
@@ -42,15 +42,19 @@ use crate::permission::{
     ApprovalDecision, ApprovalRequest, ApprovalResponse, ApprovalScope, PermissionDecision,
     PermissionManager,
 };
+use crate::plan::{
+    compaction_summary as plan_compaction_summary, reduce_plan, return_in_progress_to_pending,
+    validate_transition as validate_plan_transition, PlanSnapshot,
+};
 use crate::provider::{build_provider, FailedTurn, Provider, ProviderEvent, StreamTerminal};
 use crate::session::{
     project_model_messages, CompactionRecord, ModelChangeRecord, NoticeLevel, NoticeRecord,
-    SessionEntry, SessionEntryPayload,
+    PlanReminderReason, PlanReminderRecord, SessionEntry, SessionEntryPayload,
 };
 use crate::storage::{AppPaths, SessionManager, WorkspacePreferences};
 use crate::tools::{
-    default_registry, detect_shell, normalize_outcome, PreparedToolCall, ToolContext, ToolError,
-    ToolErrorCode, ToolOutcome, ToolOutput, ToolRegistry, ToolSpec,
+    default_registry, detect_shell, normalize_outcome, PreparedToolCall, ToolContext, ToolEffect,
+    ToolError, ToolErrorCode, ToolOutcome, ToolOutput, ToolRegistry, ToolSpec,
 };
 use crate::util;
 use crate::workspace::Workspace;
@@ -345,6 +349,11 @@ impl Agent {
         };
         let next_budget = budget_from_settings(&settings);
         let next_provider = build_provider(settings);
+        let default_effort = self
+            .config
+            .model_default_effort(&selection.provider, &selection.model)
+            .expect("resolved selection must have a normalized default effort")
+            .to_string();
         let previous_effort = self
             .workspace_preferences
             .effort(&selection.provider, &selection.model)
@@ -353,6 +362,7 @@ impl Agent {
             &selection.provider,
             &selection.model,
             &selection.effort,
+            &default_effort,
         ) {
             emit(AgentEvent::Error(format!(
                 "保存 workspace 思考程度失败,未切换模型: {:#}",
@@ -361,13 +371,12 @@ impl Agent {
             return;
         }
         if !self.record_model_change(&selection, emit) {
-            let restore = previous_effort
-                .as_deref()
-                .unwrap_or(DEFAULT_REASONING_EFFORT);
+            let restore = previous_effort.as_deref().unwrap_or(&default_effort);
             if let Err(error) = self.workspace_preferences.set_effort(
                 &selection.provider,
                 &selection.model,
                 restore,
+                &default_effort,
             ) {
                 emit(AgentEvent::Error(format!(
                     "回滚 workspace 思考程度失败: {:#}",
@@ -509,7 +518,8 @@ impl Agent {
         let mut specs: Vec<ToolSpec> = self.tools.specs();
         specs.sort_by(|left, right| left.name.cmp(&right.name));
         let mut stop_hook_active = false;
-        for _round in 0..self.config.max_turns {
+        let mut plan_reminder_sent = false;
+        for round in 0..self.config.max_turns {
             if cancel.load(Ordering::Relaxed) {
                 self.finish_run(inbox, queues, true, emit);
                 return;
@@ -604,6 +614,40 @@ impl Agent {
                         continue;
                     }
                 }
+                // A queued user correction/task takes precedence over the automatic reminder.
+                // Drain now; the existing stop path below will commit this assistant message
+                // before injecting exactly one queued input.
+                self.drain_inbox(inbox, &mut queues, emit, cancel);
+                let has_queued_input = !queues.steering.is_empty() || !queues.follow_up.is_empty();
+                if output.stop != StopReason::MaxTokens
+                    && !plan_reminder_sent
+                    && !has_queued_input
+                    && !cancel.load(Ordering::Relaxed)
+                    && round + 1 < self.config.max_turns
+                {
+                    let plan = reduce_plan(&self.entries).snapshot;
+                    if plan.has_active_items() {
+                        if !self.commit(
+                            vec![
+                                assistant_payload,
+                                SessionEntryPayload::PlanReminder(PlanReminderRecord {
+                                    revision: plan.revision,
+                                    reason: PlanReminderReason::Continue,
+                                }),
+                            ],
+                            emit,
+                        ) {
+                            self.finish_run(inbox, queues, false, emit);
+                            return;
+                        }
+                        emit(AgentEvent::Notice(format!(
+                            "计划 #{} 仍有未完成项，已要求模型继续一次",
+                            plan.revision
+                        )));
+                        plan_reminder_sent = true;
+                        continue;
+                    }
+                }
                 let mut payloads = vec![assistant_payload];
                 if output.stop == StopReason::MaxTokens {
                     // UI-only 事实:提示截断,但绝不进入模型上下文。
@@ -652,7 +696,7 @@ impl Agent {
                     summary: util::args_summary(&args),
                 });
                 let truncated = output.stop == StopReason::MaxTokens;
-                let item = self.preflight_tool_call(id, name, &args, truncated, emit, cancel);
+                let mut item = self.preflight_tool_call(id, name, &args, truncated, emit, cancel);
                 if let BatchItemState::Settled(outcome) = &item.state {
                     // preflight 定案(校验失败/拒绝/截断):立即闭合该调用的事件。
                     emit(AgentEvent::ToolCallFinished {
@@ -661,6 +705,7 @@ impl Agent {
                         output: outcome.output.clone(),
                         error: outcome.error.clone(),
                     });
+                    item.finish_emitted = true;
                 }
                 items.push(item);
             }
@@ -669,6 +714,8 @@ impl Agent {
             let mut was_cancelled = false;
             let mut stop_after_commit = None;
             let mut results: Vec<Block> = Vec::with_capacity(items.len());
+            let mut plan_updates = Vec::new();
+            let mut deferred_finishes = Vec::new();
             for item in items {
                 let outcome = item.outcome.unwrap_or_else(|| {
                     // 防御:执行器保证每个调用都有结果;若缺失,补错误而不是丢配对。
@@ -684,6 +731,19 @@ impl Agent {
                     .error
                     .as_ref()
                     .is_some_and(|error| error.code == ToolErrorCode::Aborted);
+                for effect in outcome.effects {
+                    match effect {
+                        ToolEffect::PlanUpdated(snapshot) => plan_updates.push(snapshot),
+                    }
+                }
+                if !item.finish_emitted {
+                    deferred_finishes.push((
+                        item.id.clone(),
+                        item.name.clone(),
+                        outcome.output.clone(),
+                        outcome.error.clone(),
+                    ));
+                }
                 results.push(Block::ToolResult {
                     tool_use_id: item.id,
                     content: outcome.output.model_text,
@@ -695,16 +755,30 @@ impl Agent {
                 role: Role::User,
                 blocks: results,
             };
-            // ToolUse 与所有 ToolResult 必须原子落库,否则崩溃恢复后历史会非法。
-            if !self.commit(
-                vec![
-                    assistant_payload,
-                    SessionEntryPayload::message(result_message, None),
-                ],
-                emit,
-            ) {
+            // ToolUse、harness-owned effects 与所有 ToolResult 必须原子落库。
+            let mut payloads = Vec::with_capacity(plan_updates.len() + 2);
+            payloads.push(assistant_payload);
+            payloads.extend(
+                plan_updates
+                    .iter()
+                    .cloned()
+                    .map(SessionEntryPayload::PlanUpdated),
+            );
+            payloads.push(SessionEntryPayload::message(result_message, None));
+            if !self.commit(payloads, emit) {
                 self.finish_run(inbox, queues, was_cancelled, emit);
                 return;
+            }
+            for (id, name, output, error) in deferred_finishes {
+                emit(AgentEvent::ToolCallFinished {
+                    id,
+                    name,
+                    output,
+                    error,
+                });
+            }
+            for snapshot in plan_updates {
+                emit_plan_updated(&snapshot, emit);
             }
             if was_cancelled {
                 self.finish_run(inbox, queues, true, emit);
@@ -804,6 +878,19 @@ impl Agent {
                     }
                 }
             }
+            let current_plan = reduce_plan(&self.entries).snapshot;
+            if let Some(repaired) = return_in_progress_to_pending(&current_plan) {
+                let payloads = vec![
+                    SessionEntryPayload::PlanUpdated(repaired.clone()),
+                    SessionEntryPayload::PlanReminder(PlanReminderRecord {
+                        revision: repaired.revision,
+                        reason: PlanReminderReason::Cancelled,
+                    }),
+                ];
+                if self.commit(payloads, emit) {
+                    emit_plan_updated(&repaired, emit);
+                }
+            }
         }
         let dropped = queues.steering.len() + queues.follow_up.len();
         if dropped > 0 {
@@ -868,9 +955,16 @@ impl Agent {
                     emit(AgentEvent::TurnFinished { cancelled: false });
                     return;
                 }
+                let mut persisted_summary = summary.clone();
+                if let Some(plan_summary) =
+                    plan_compaction_summary(&reduce_plan(&self.entries).snapshot)
+                {
+                    persisted_summary.push_str("\n\n");
+                    persisted_summary.push_str(&plan_summary);
+                }
                 let committed = self.commit(
                     vec![SessionEntryPayload::Compaction(CompactionRecord {
-                        summary: summary.clone(),
+                        summary: persisted_summary,
                         tokens_before,
                     })],
                     emit,
@@ -917,6 +1011,7 @@ impl Agent {
             state: BatchItemState::Settled(normalize_outcome(outcome.clone())),
             outcome: Some(normalize_outcome(outcome)),
             hook_stop: None,
+            finish_emitted: false,
         };
 
         // `length` 截断的参数可能"语法合法但语义不完整",整批一个都不执行。
@@ -984,6 +1079,7 @@ impl Agent {
             state: BatchItemState::Ready(prepared),
             outcome: None,
             hook_stop: None,
+            finish_emitted: false,
         }
     }
 
@@ -1029,6 +1125,7 @@ impl Agent {
         };
         let timeout = self.config.tool_timeout;
         let session_id = self.sessions.current_id().to_string();
+        let mut batch_plan = reduce_plan(&self.entries).snapshot;
         // 字段级拆分借用:worker 只读 tools/workspace,协调侧独占 hooks。
         let tools = &self.tools;
         let workspace = &self.workspace;
@@ -1087,6 +1184,7 @@ impl Agent {
                             error: outcome.error.clone(),
                         });
                         items[item_index].outcome = Some(outcome);
+                        items[item_index].finish_emitted = true;
                         settled[slot] = true;
                         completed += 1;
                         continue;
@@ -1099,6 +1197,7 @@ impl Agent {
                     let progress_tx = tx.clone();
                     let done_tx = tx.clone();
                     let sid = session_id.clone();
+                    let current_plan = batch_plan.clone();
                     deadlines[slot] = timeout.map(|limit| std::time::Instant::now() + limit);
                     scope.spawn(move || {
                         let mut progress = move |update: ToolOutput| {
@@ -1111,9 +1210,14 @@ impl Agent {
                             workspace,
                             cancel: &flag,
                             session_id: &sid,
+                            current_plan,
                             progress: &mut progress,
+                            effects: Vec::new(),
                         };
-                        let outcome = tools.execute_prepared(&prepared, &mut ctx);
+                        let mut outcome = tools.execute_prepared(&prepared, &mut ctx);
+                        if outcome.error.is_none() {
+                            outcome.effects = ctx.take_effects();
+                        }
                         let _ = done_tx.send(WorkerMsg::Done { slot, outcome });
                     });
                     running += 1;
@@ -1156,7 +1260,7 @@ impl Agent {
                             }
                         }
                         let item_index = ready[slot];
-                        let (post_outcome, hook_stop) = {
+                        let (mut post_outcome, hook_stop) = {
                             let BatchItemState::Ready(prepared) = &items[item_index].state else {
                                 unreachable!("ready 列表只含 Ready 项");
                             };
@@ -1169,12 +1273,23 @@ impl Agent {
                             emit_hook_warnings(post.warnings, emit);
                             (normalize_outcome(post.outcome), post.stop_after_commit)
                         };
-                        emit(AgentEvent::ToolCallFinished {
-                            id: items[item_index].id.clone(),
-                            name: items[item_index].name.clone(),
-                            output: post_outcome.output.clone(),
-                            error: post_outcome.error.clone(),
-                        });
+                        if let Err(error) =
+                            apply_tool_effects(&mut batch_plan, &post_outcome.effects)
+                        {
+                            post_outcome = ToolOutcome::failure(ToolError::new(
+                                ToolErrorCode::Internal,
+                                format!("invalid harness tool effect: {error}"),
+                            ));
+                        }
+                        if post_outcome.effects.is_empty() {
+                            emit(AgentEvent::ToolCallFinished {
+                                id: items[item_index].id.clone(),
+                                name: items[item_index].name.clone(),
+                                output: post_outcome.output.clone(),
+                                error: post_outcome.error.clone(),
+                            });
+                            items[item_index].finish_emitted = true;
+                        }
                         items[item_index].outcome = Some(post_outcome);
                         items[item_index].hook_stop = hook_stop;
                     }
@@ -1356,6 +1471,7 @@ struct BatchItem {
     state: BatchItemState,
     outcome: Option<ToolOutcome>,
     hook_stop: Option<String>,
+    finish_emitted: bool,
 }
 
 enum BatchItemState {
@@ -1440,6 +1556,29 @@ fn permission_denied(reason: String) -> ToolOutcome {
     ToolOutcome::failure(ToolError::new(ToolErrorCode::PermissionDenied, reason))
 }
 
+fn apply_tool_effects(
+    current_plan: &mut PlanSnapshot,
+    effects: &[ToolEffect],
+) -> Result<(), String> {
+    for effect in effects {
+        match effect {
+            ToolEffect::PlanUpdated(snapshot) => {
+                validate_plan_transition(current_plan, snapshot).map_err(|error| error.message)?;
+                *current_plan = snapshot.clone();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_plan_updated(snapshot: &PlanSnapshot, emit: &mut dyn FnMut(AgentEvent)) {
+    emit(AgentEvent::PlanUpdated {
+        revision: snapshot.revision,
+        items: snapshot.items.clone(),
+        explanation: snapshot.explanation.clone(),
+    });
+}
+
 fn emit_hook_warnings(warnings: Vec<String>, emit: &mut dyn FnMut(AgentEvent)) {
     for warning in warnings {
         emit(AgentEvent::Notice(warning));
@@ -1518,11 +1657,12 @@ pub fn spawn(agent: Agent) -> RuntimeHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, DEFAULT_REASONING_EFFORT};
     use crate::hooks::{
         Hook, PreToolUseContext, PreToolUseHookResult, StopContext, StopHookResult,
     };
     use crate::permission::{PermissionRule, PermissionRules};
+    use crate::plan::{PlanItem, PlanStatus};
     use crate::provider::{ProviderError, StreamTerminal};
     use crate::tools::{Tool, ToolCapabilities, ToolOutput, ToolPermissionSpec};
     use std::collections::VecDeque;
@@ -1750,9 +1890,6 @@ max_tokens = 4096
 [providers.mock.models.large]
 context_window = 200000
 max_tokens = 32000
-
-[providers.mock.models.large.reasoning]
-send_effort = true
 efforts = ["low", "medium", "high"]
 "#,
         )
@@ -1843,6 +1980,19 @@ efforts = ["low", "medium", "high"]
             },
             StopReason::ToolUse,
         )
+    }
+
+    fn update_plan_turn(
+        expected_revision: u64,
+        items: serde_json::Value,
+    ) -> crate::provider::TurnOutput {
+        tool_turn(vec![(
+            "update_plan",
+            serde_json::json!({
+                "expected_revision": expected_revision,
+                "plan": items,
+            }),
+        )])
     }
 
     fn install_counted_tool(
@@ -2341,6 +2491,249 @@ efforts = ["low", "medium", "high"]
         assert!(events
             .iter()
             .any(|event| matches!(event, AgentEvent::TurnFinished { cancelled: false })));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_events_and_success_finish_are_emitted_after_commit() {
+        let root = temp_root("plan-commit-event");
+        let data_dir = root.join("data");
+        let mut agent = Agent::new_with_data_dir(
+            config(&root),
+            Workspace::new(root.clone()),
+            data_dir.clone(),
+        )
+        .unwrap();
+        agent.provider = Box::new(ScriptedProvider::new(vec![
+            ScriptStep::Output(update_plan_turn(
+                0,
+                serde_json::json!([
+                    {"id": "done", "text": "Already complete", "status": "completed"}
+                ]),
+            )),
+            ScriptStep::Output(output(
+                ChatMessage {
+                    role: Role::Assistant,
+                    blocks: vec![Block::Text("finished".into())],
+                },
+                StopReason::EndTurn,
+            )),
+        ]));
+        let database = data_dir
+            .join("sessions")
+            .join(format!("{}.db", agent.session_id()));
+        let mut events = Vec::new();
+        agent.handle_command(
+            AgentCommand::UserInput("make a plan".into()),
+            &mut |event| {
+                if matches!(
+                    &event,
+                    AgentEvent::ToolCallFinished { name, error: None, .. }
+                        if name == "update_plan"
+                ) || matches!(&event, AgentEvent::PlanUpdated { .. })
+                {
+                    let connection = rusqlite::Connection::open(&database).unwrap();
+                    let count: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM entries WHERE kind = 'plan_updated'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(count, 1, "success events must observe committed state");
+                }
+                events.push(event);
+            },
+            &AtomicBool::new(false),
+        );
+
+        let fact_index = agent
+            .entries
+            .iter()
+            .position(|entry| matches!(entry.payload, SessionEntryPayload::PlanUpdated(_)))
+            .unwrap();
+        assert!(matches!(
+            agent.entries[fact_index - 1].payload,
+            SessionEntryPayload::Message(_)
+        ));
+        assert!(matches!(
+            agent.entries[fact_index + 1].payload,
+            SessionEntryPayload::Message(_)
+        ));
+        let finished = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolCallFinished { name, .. } if name == "update_plan"))
+            .unwrap();
+        let updated = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::PlanUpdated { revision: 1, .. }))
+            .unwrap();
+        assert!(finished < updated);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_plan_triggers_only_one_continuation_reminder() {
+        let root = temp_root("plan-reminder");
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new_with_data_dir(
+            config_with_max_turns(&root, 4),
+            Workspace::new(root.clone()),
+            root.join("data"),
+        )
+        .unwrap();
+        agent.provider = Box::new(ScriptedProvider::with_prompt_log(
+            vec![
+                ScriptStep::Output(update_plan_turn(
+                    0,
+                    serde_json::json!([
+                        {"id": "work", "text": "Do the work", "status": "in_progress"}
+                    ]),
+                )),
+                ScriptStep::Output(output(
+                    ChatMessage {
+                        role: Role::Assistant,
+                        blocks: vec![Block::Text("stopping early".into())],
+                    },
+                    StopReason::EndTurn,
+                )),
+                ScriptStep::Output(output(
+                    ChatMessage {
+                        role: Role::Assistant,
+                        blocks: vec![Block::Text("still stopping".into())],
+                    },
+                    StopReason::EndTurn,
+                )),
+            ],
+            Arc::clone(&prompts),
+        ));
+        let mut events = Vec::new();
+        agent.handle_command(
+            AgentCommand::UserInput("long task".into()),
+            &mut |event| events.push(event),
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(prompts.lock().unwrap().len(), 3);
+        assert_eq!(
+            agent
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.payload, SessionEntryPayload::PlanReminder(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Notice(text) if text.contains("要求模型继续一次")))
+                .count(),
+            1
+        );
+        assert_eq!(reduce_plan(&agent.entries).snapshot.revision, 1);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFinished { cancelled: false })));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancellation_returns_in_progress_item_to_pending_as_a_new_fact() {
+        let root = temp_root("plan-cancel");
+        let mut agent = Agent::new_with_data_dir(
+            config(&root),
+            Workspace::new(root.clone()),
+            root.join("data"),
+        )
+        .unwrap();
+        agent.provider = Box::new(ScriptedProvider::new(vec![
+            ScriptStep::Output(update_plan_turn(
+                0,
+                serde_json::json!([
+                    {"id": "work", "text": "Do the work", "status": "in_progress"}
+                ]),
+            )),
+            ScriptStep::Cancel,
+        ]));
+        let mut events = Vec::new();
+        agent.handle_command(
+            AgentCommand::UserInput("cancel me".into()),
+            &mut |event| events.push(event),
+            &AtomicBool::new(false),
+        );
+
+        let plan = reduce_plan(&agent.entries).snapshot;
+        assert_eq!(plan.revision, 2);
+        assert_eq!(plan.items[0].status, PlanStatus::Pending);
+        assert_eq!(
+            agent
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.payload, SessionEntryPayload::PlanUpdated(_)))
+                .count(),
+            2
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::PlanUpdated { revision: 2, .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFinished { cancelled: true })));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compaction_keeps_only_active_plan_items_and_completed_count() {
+        let root = temp_root("compact-plan");
+        let mut agent = Agent::new_with_data_dir(
+            config(&root),
+            Workspace::new(root.clone()),
+            root.join("data"),
+        )
+        .unwrap();
+        assert!(agent.commit(
+            vec![
+                SessionEntryPayload::message(ChatMessage::user_text("task"), None),
+                SessionEntryPayload::PlanUpdated(PlanSnapshot {
+                    revision: 1,
+                    items: vec![
+                        PlanItem {
+                            id: "done".into(),
+                            text: "Completed detail must be folded".into(),
+                            status: PlanStatus::Completed,
+                        },
+                        PlanItem {
+                            id: "active".into(),
+                            text: "Active detail must remain".into(),
+                            status: PlanStatus::Pending,
+                        },
+                    ],
+                    explanation: None,
+                }),
+            ],
+            &mut |_| {},
+        ));
+        agent.provider = Box::new(ScriptedProvider::new(vec![ScriptStep::Output(output(
+            ChatMessage {
+                role: Role::Assistant,
+                blocks: vec![Block::Text("base summary".into())],
+            },
+            StopReason::EndTurn,
+        ))]));
+        agent.handle_command(AgentCommand::Compact, &mut |_| {}, &AtomicBool::new(false));
+
+        let summary = agent
+            .entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.payload {
+                SessionEntryPayload::Compaction(compaction) => Some(compaction.summary.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(summary.contains("Active plan revision 1; 1 completed"));
+        assert!(summary.contains("Active detail must remain"));
+        assert!(!summary.contains("Completed detail must be folded"));
         let _ = std::fs::remove_dir_all(root);
     }
 

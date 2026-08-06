@@ -15,6 +15,7 @@
 
 use crate::message::CacheUsage;
 use crate::permission::ApprovalRequest;
+use crate::plan::PlanItem;
 use crate::session::SessionEntry;
 use crate::storage::SessionSummary;
 use crate::tools::{ToolError, ToolOutput};
@@ -91,6 +92,13 @@ pub enum AgentEvent {
         name: String,
         output: ToolOutput,
         error: Option<ToolError>,
+    },
+
+    /// A committed structured plan snapshot. Frontends must not display speculative state.
+    PlanUpdated {
+        revision: u64,
+        items: Vec<PlanItem>,
+        explanation: Option<String>,
     },
 
     /// Runtime 正在独立审批通道上等待；普通命令通道不会承担回复职责。
