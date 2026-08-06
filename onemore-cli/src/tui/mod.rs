@@ -50,6 +50,7 @@ use crate::permission::{ApprovalDecision, ApprovalRequest, ApprovalResponse, App
 use crate::plan::reduce_plan;
 use crate::runtime::RuntimeHandle;
 use crate::session::{SessionEntry, SessionEntryPayload};
+use crate::skills::SkillMetadata;
 use crate::util;
 use input::InputBox;
 use picker::{Picker, PickerItem};
@@ -65,6 +66,7 @@ const HELP_TEXT: &str = "斜杠命令\n\
   /reasoning         调整当前模型的思考程度\n\
   /provider          选择 provider(对话历史保留)\n\
   /session [ID]      列出或恢复历史会话\n\
+  /skill [名称]       选择并加载一个本地技能\n\
   /compact           压缩历史(摘要替代模型视图,事实保留)\n\
   /queue <内容>      排队后续任务(当前任务结束后执行)\n\
   /clear             清空会话\n\
@@ -80,6 +82,7 @@ enum PickerKind {
     Model,
     Reasoning,
     Session,
+    Skill,
 }
 
 #[derive(Debug)]
@@ -154,6 +157,7 @@ struct App {
     provider_label: String,
     active_selection: ActiveModelSelection,
     provider_catalog: Vec<ProviderCatalogEntry>,
+    skills: Vec<SkillMetadata>,
     reasoning_preferences: BTreeMap<String, BTreeMap<String, String>>,
     pending_reasoning: Option<PendingReasoningSelection>,
     session_id: String,
@@ -191,6 +195,7 @@ impl App {
             provider_label,
             active_selection,
             provider_catalog,
+            skills: Vec::new(),
             reasoning_preferences,
             pending_reasoning: None,
             session_id,
@@ -337,6 +342,18 @@ impl App {
                 items,
                 explanation,
             } => self.transcript.push_plan(revision, items, explanation),
+            AgentEvent::SkillsDiscovered { skills, warnings } => {
+                self.skills = skills.clone();
+                self.status_note = format!("已发现 {} 个技能", skills.len());
+                if !skills.is_empty() {
+                    self.transcript
+                        .push_notice(format!("已发现 {} 个可用技能", skills.len()));
+                }
+                for warning in warnings {
+                    self.transcript
+                        .push_notice(format!("技能发现警告: {}", warning));
+                }
+            }
             AgentEvent::PermissionRequested { request } => {
                 self.status_note = format!("等待审批: {}", request.tool);
                 self.overlay = Some(Overlay::Approval {
@@ -898,11 +915,15 @@ impl App {
                     .send(AgentCommand::LoadSession(session_id));
                 self.overlay = None;
             }
+            (PickerKind::Skill, Some(name)) => {
+                self.submit_skill(name);
+            }
             (
                 PickerKind::Provider
                 | PickerKind::Model
                 | PickerKind::Reasoning
-                | PickerKind::Session,
+                | PickerKind::Session
+                | PickerKind::Skill,
                 None,
             ) => {}
         }
@@ -1046,6 +1067,13 @@ impl App {
                         .send(AgentCommand::LoadSession(rest.to_string()));
                 }
             }
+            command::SlashCommand::Skill => {
+                if rest.is_empty() {
+                    self.open_skill_picker();
+                } else {
+                    self.submit_skill(rest.to_string());
+                }
+            }
             command::SlashCommand::Provider => {
                 if rest.is_empty() {
                     self.open_provider_picker();
@@ -1071,6 +1099,43 @@ impl App {
                 }
             }
         }
+    }
+
+    fn open_skill_picker(&mut self) {
+        if self.skills.is_empty() {
+            self.transcript
+                .push_notice("当前 Runtime 没有发现可用技能".into());
+            return;
+        }
+        let items = self
+            .skills
+            .iter()
+            .map(|skill| PickerItem {
+                label: skill.name.clone(),
+                description: format!("{} · {}", skill.scope.as_str(), skill.description),
+                value: Some(skill.name.clone()),
+                current: false,
+            })
+            .collect();
+        self.overlay = Some(Overlay::Picker {
+            kind: PickerKind::Skill,
+            picker: Picker::new("选择技能", items),
+        });
+    }
+
+    fn submit_skill(&mut self, name: String) {
+        if !self.skills.iter().any(|skill| skill.name == name) {
+            self.transcript
+                .push_error(format!("未发现技能 {:?}，请先重启或检查技能目录", name));
+            self.overlay = None;
+            return;
+        }
+        self.overlay = None;
+        let text = format!("请先加载并遵循技能 {:?}，然后继续处理这个请求。", name);
+        self.history.push(text.clone());
+        self.history_idx = None;
+        self.scroll_up = 0;
+        let _ = self.handle.commands.send(AgentCommand::UserInput(text));
     }
 
     fn open_provider_picker(&mut self) {
@@ -1833,6 +1898,34 @@ mod tests {
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
         match cmd.try_recv() {
             Ok(AgentCommand::UserInput(t)) => assert_eq!(t, "第一行\n第二行"),
+            other => panic!("应收到 UserInput,得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn skill_picker_dispatches_an_ordinary_user_input() {
+        let (mut app, _evt, cmd, _approvals) = dummy_app();
+        app.on_agent_event(AgentEvent::SkillsDiscovered {
+            skills: vec![SkillMetadata {
+                name: "demo".into(),
+                description: "demo skill".into(),
+                scope: crate::skills::SkillScope::Repo,
+                path: "workspace/.onemore/skills/demo/SKILL.md".into(),
+                content_hash: [0; 32],
+            }],
+            warnings: Vec::new(),
+        });
+        app.handle_slash("skill");
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Picker {
+                kind: PickerKind::Skill,
+                ..
+            })
+        ));
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        match cmd.try_recv() {
+            Ok(AgentCommand::UserInput(text)) => assert!(text.contains("demo")),
             other => panic!("应收到 UserInput,得到 {:?}", other),
         }
     }

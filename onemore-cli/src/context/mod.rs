@@ -19,6 +19,7 @@
 
 pub mod budget;
 pub mod instructions;
+pub mod skills;
 pub mod workspace_info;
 
 use crate::message::ChatMessage;

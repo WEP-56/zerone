@@ -12,8 +12,8 @@ Read that document before designing advanced features. It contains the evidence-
 
 Recommended implementation order from the research:
 
-1. ~~`update_plan` and long-running task discipline~~ (completed 2026-08-05);
-2. Skills;
+1. ~~`update_plan` and long-running task discipline~~ (implemented 2026-08-05, user-verified 2026-08-06);
+2. Skills (next session);
 3. MCP stdio integration;
 4. durable background processes, then subagents.
 
@@ -40,6 +40,16 @@ Intentionally absent:
 - MCP client/server integration;
 - background processes as durable tasks;
 - subagents.
+
+## Verification Status
+
+User acceptance testing on 2026-08-06 confirmed:
+
+- standard and custom reasoning effort lists are selectable in the TUI and are sent correctly by the configured provider;
+- `update_plan` works through the full plan lifecycle and survives the intended runtime/UI path;
+- long-running task reminders behave as intended without preventing completion.
+
+The next session should begin the Skills implementation. Keep the existing plan reducer, fact/event boundaries, and prompt-cache constraints intact while adding skill discovery and loading.
 
 Relevant Onemore files:
 
@@ -129,7 +139,7 @@ Questions:
 - How are plan updates emitted to the frontend without polluting model history?
 - What survives compaction and session restore?
 
-### Skills
+### Skills (Next Session)
 
 Grok Build:
 

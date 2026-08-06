@@ -172,6 +172,14 @@ fn run_once(mut agent: Agent, prompt: String) -> Result<()> {
                     eprintln!("  [{}] {}: {}", item.status.as_str(), item.id, item.text);
                 }
             }
+            AgentEvent::SkillsDiscovered { skills, warnings } => {
+                if !skills.is_empty() {
+                    eprintln!("· 已发现 {} 个可用技能", skills.len());
+                }
+                for warning in warnings {
+                    eprintln!("· 技能发现警告: {}", warning);
+                }
+            }
             AgentEvent::Usage {
                 input_tokens,
                 output_tokens,

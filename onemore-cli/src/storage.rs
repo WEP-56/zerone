@@ -52,11 +52,11 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
-    /// `ONEMORE_HOME` 是测试和便携安装的显式覆盖；正常运行使用 `~/.onemore`。
+    /// `ONEMORE_HOME` 是测试和便携安装的显式覆盖；正常运行使用平台数据目录。
     pub fn discover() -> Result<Self> {
         let root = match std::env::var_os(APP_HOME_ENV) {
             Some(path) if !path.is_empty() => PathBuf::from(path),
-            _ => user_home_dir()?.join(APP_DIR_NAME),
+            _ => platform_app_root()?,
         };
         Ok(Self::from_root(root))
     }
@@ -207,6 +207,30 @@ fn user_home_dir() -> Result<PathBuf> {
 
     home.map(PathBuf::from)
         .ok_or_else(|| anyhow!("无法确定用户主目录，请设置 {}", APP_HOME_ENV))
+}
+
+fn platform_app_root() -> Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            return Ok(PathBuf::from(app_data).join("onemore"));
+        }
+        Ok(user_home_dir()?
+            .join("AppData")
+            .join("Roaming")
+            .join("onemore"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+            return Ok(PathBuf::from(data_home).join("onemore"));
+        }
+        Ok(user_home_dir()?
+            .join(".local")
+            .join("share")
+            .join("onemore"))
+    }
 }
 
 #[derive(Debug, Clone)]

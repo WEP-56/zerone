@@ -17,6 +17,7 @@ use crate::message::CacheUsage;
 use crate::permission::ApprovalRequest;
 use crate::plan::PlanItem;
 use crate::session::SessionEntry;
+use crate::skills::SkillMetadata;
 use crate::storage::SessionSummary;
 use crate::tools::{ToolError, ToolOutput};
 
@@ -99,6 +100,12 @@ pub enum AgentEvent {
         revision: u64,
         items: Vec<PlanItem>,
         explanation: Option<String>,
+    },
+
+    /// The startup-frozen local skill catalog and any discovery diagnostics.
+    SkillsDiscovered {
+        skills: Vec<SkillMetadata>,
+        warnings: Vec<String>,
     },
 
     /// Runtime 正在独立审批通道上等待；普通命令通道不会承担回复职责。

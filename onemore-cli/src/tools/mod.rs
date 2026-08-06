@@ -14,6 +14,7 @@ use crate::workspace::Workspace;
 
 mod edit_file;
 mod list_dir;
+mod load_skill;
 mod read_file;
 mod run_command;
 mod update_plan;
@@ -512,7 +513,10 @@ fn json_type(value: &Value) -> &'static str {
     }
 }
 
-pub fn default_registry(shell: Shell) -> ToolRegistry {
+pub fn default_registry(
+    shell: Shell,
+    skills: std::sync::Arc<crate::skills::SkillCatalog>,
+) -> ToolRegistry {
     ToolRegistry::new(vec![
         Box::new(read_file::ReadFile),
         Box::new(list_dir::ListDir),
@@ -520,6 +524,7 @@ pub fn default_registry(shell: Shell) -> ToolRegistry {
         Box::new(edit_file::EditFile),
         Box::new(run_command::RunCommand::new(shell)),
         Box::new(update_plan::UpdatePlan),
+        Box::new(load_skill::LoadSkill::new(skills)),
     ])
 }
 

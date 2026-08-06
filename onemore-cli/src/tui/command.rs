@@ -9,6 +9,7 @@ pub enum SlashCommand {
     Reasoning,
     Provider,
     Session,
+    Skill,
     Queue,
     Compact,
     Clear,
@@ -48,6 +49,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         command: SlashCommand::Session,
         name: "session",
         description: "列出或恢复当前 workspace 的会话",
+        accepts_args: true,
+    },
+    CommandSpec {
+        command: SlashCommand::Skill,
+        name: "skill",
+        description: "选择并加载一个本地技能",
         accepts_args: true,
     },
     CommandSpec {
@@ -156,6 +163,13 @@ mod tests {
             find("effort").map(|s| s.command),
             Some(SlashCommand::Reasoning)
         );
+    }
+
+    #[test]
+    fn skill_command_accepts_arguments() {
+        let spec = find("skill").unwrap();
+        assert!(spec.accepts_args);
+        assert_eq!(matches("ski")[0].command, SlashCommand::Skill);
     }
 
     #[test]

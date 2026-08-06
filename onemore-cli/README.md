@@ -138,9 +138,20 @@ Zerone 是刻意压低复杂度的可运行基线;Onemore 在同一架构骨架�
 - 模型准备结束但计划仍有活动项时，Runtime 最多追加一次继续提醒；之后允许结束，
   不会形成无限 completion gate。steering/follow-up 的优先级高于自动提醒。
 
+### 8. Skills
+
+- 启动时扫描当前 workspace 的 `.onemore/skills/**/SKILL.md` 与平台全局目录的
+  `skills/**/SKILL.md`（Windows 默认 `%APPDATA%\onemore\skills`，也可用
+  `ONEMORE_HOME` 覆盖），目录快照在
+  当前 Runtime 内冻结。Repo 技能覆盖 User 同名技能，单个坏文件只产生警告。
+- `SKILL.md` 需要 YAML frontmatter 中的 `name` 与 `description`；system prompt
+  只包含稳定 metadata catalog，正文按需由模型调用 `load_skill({"name": "..."})`。
+- 技能正文和它引导的工具调用仍受原有权限、审批和工具能力策略控制；文件变化会被
+  识别为 stale catalog，下一次启动才重新发现。
+
 ### 尚未实现
 
-Skills、MCP、持久 Background/Task 系统、子代理、树形会话的 move/fork、
+MCP、持久 Background/Task 系统、子代理、树形会话的 move/fork、
 自动触发的 compaction(当前需手动 `/compact`)。
 
 ## 配置增量

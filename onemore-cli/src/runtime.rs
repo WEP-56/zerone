@@ -33,6 +33,7 @@ use std::time::Duration;
 use crate::config::{ActiveModelSelection, Config, ProviderCatalogEntry};
 use crate::context::budget::{apply_budget, estimate_tokens, BudgetDecision, ContextBudget};
 use crate::context::instructions::Instructions;
+use crate::context::skills::SkillsContext;
 use crate::context::workspace_info::WorkspaceInfo;
 use crate::context::{ContextProvider, PromptContext};
 use crate::event::{AgentCommand, AgentEvent};
@@ -51,6 +52,7 @@ use crate::session::{
     project_model_messages, CompactionRecord, ModelChangeRecord, NoticeLevel, NoticeRecord,
     PlanReminderReason, PlanReminderRecord, SessionEntry, SessionEntryPayload,
 };
+use crate::skills::{discover, SkillCatalog};
 use crate::storage::{AppPaths, SessionManager, WorkspacePreferences};
 use crate::tools::{
     default_registry, detect_shell, normalize_outcome, PreparedToolCall, ToolContext, ToolEffect,
@@ -145,6 +147,9 @@ pub struct Agent {
     workspace_preferences: WorkspacePreferences,
     permissions: PermissionManager,
     hooks: HookRegistry,
+    skills: std::sync::Arc<SkillCatalog>,
+    skill_warnings: Vec<String>,
+    skills_announced: bool,
     approval_rx: Option<Receiver<ApprovalResponse>>,
     /// 活动运行中收到、需要等本轮结束再执行的命令(/clear、/provider 等)。
     deferred: std::collections::VecDeque<AgentCommand>,
@@ -164,13 +169,19 @@ impl Agent {
         data_dir: std::path::PathBuf,
     ) -> anyhow::Result<Agent> {
         let shell = detect_shell(&config.shell);
+        let paths = AppPaths::from_root(data_dir.clone());
+        paths.ensure()?;
+        let discovered = discover(
+            &workspace.root().join(".onemore").join("skills"),
+            &paths.root.join("skills"),
+        );
+        let skills = std::sync::Arc::new(discovered.catalog);
         let extra_context: Vec<Box<dyn ContextProvider>> = vec![
             Box::new(Instructions::new(config.system_prompt.clone())),
             Box::new(WorkspaceInfo::new(&shell)),
+            Box::new(SkillsContext::new(skills.clone())),
             // ← 未来的 PlanningContext / MemoryContext 插在这里
         ];
-        let paths = AppPaths::from_root(data_dir);
-        paths.ensure()?;
         let mut active_selection = config.default_selection(&config.active_provider)?;
         let workspace_preferences =
             WorkspacePreferences::load(&paths.workspaces, workspace.root())?;
@@ -189,7 +200,7 @@ impl Agent {
         let permissions = PermissionManager::new(config.permission_rules);
         Ok(Agent {
             workspace,
-            tools: default_registry(shell),
+            tools: default_registry(shell, skills.clone()),
             entries: Vec::new(),
             extra_context,
             provider: build_provider(settings),
@@ -202,6 +213,9 @@ impl Agent {
             workspace_preferences,
             permissions,
             hooks: HookRegistry::default(),
+            skills,
+            skill_warnings: discovered.warnings,
+            skills_announced: false,
             approval_rx: None,
             deferred: std::collections::VecDeque::new(),
         })
@@ -240,6 +254,7 @@ impl Agent {
         cancel: &AtomicBool,
         inbox: Option<&Receiver<AgentCommand>>,
     ) -> bool {
+        self.emit_skill_discovery(emit);
         match cmd {
             // 空闲时三者等价:都开启一个新的运行。
             AgentCommand::UserInput(text)
@@ -318,6 +333,17 @@ impl Agent {
             }
             AgentCommand::Shutdown => false,
         }
+    }
+
+    fn emit_skill_discovery(&mut self, emit: &mut dyn FnMut(AgentEvent)) {
+        if self.skills_announced {
+            return;
+        }
+        self.skills_announced = true;
+        emit(AgentEvent::SkillsDiscovered {
+            skills: self.skills.ordered.clone(),
+            warnings: std::mem::take(&mut self.skill_warnings),
+        });
     }
 
     fn preferred_default_selection(&self, provider: &str) -> anyhow::Result<ActiveModelSelection> {
@@ -1623,6 +1649,7 @@ pub fn spawn(agent: Agent) -> RuntimeHandle {
                 // 前端先退出时 send 会失败,忽略即可(线程随后收到 Shutdown 或通道关闭)
                 let _ = evt_tx.send(e);
             };
+            agent.emit_skill_discovery(&mut emit);
             loop {
                 // 活动运行中延迟的命令(/clear、/provider、Shutdown…)优先于新命令。
                 let cmd = match agent.take_deferred() {
@@ -1895,6 +1922,45 @@ efforts = ["low", "medium", "high"]
         )
         .unwrap();
         Config::load(&path).unwrap()
+    }
+
+    #[test]
+    fn startup_emits_frozen_skill_catalog_once() {
+        let root = temp_root("skills-event");
+        let workspace_root = root.join("workspace");
+        std::fs::create_dir_all(workspace_root.join(".onemore/skills/demo")).unwrap();
+        std::fs::write(
+            workspace_root.join(".onemore/skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: demo skill\n---\nbody",
+        )
+        .unwrap();
+        let mut agent = Agent::new_with_data_dir(
+            multi_model_config(&root),
+            Workspace::new(workspace_root),
+            root.join("data"),
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        agent.handle_command(
+            AgentCommand::ListSessions,
+            &mut |event| events.push(event),
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(
+            events.first(),
+            Some(AgentEvent::SkillsDiscovered { skills, warnings })
+                if skills.iter().any(|skill| skill.name == "demo") && warnings.is_empty()
+        ));
+        events.clear();
+        agent.handle_command(
+            AgentCommand::ListSessions,
+            &mut |event| events.push(event),
+            &AtomicBool::new(false),
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::SkillsDiscovered { .. })));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
